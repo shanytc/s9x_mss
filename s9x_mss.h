@@ -205,6 +205,16 @@ void convert_mss_to_s9x(const std::string& in_path, const std::string& out_path,
 // then HiROM header. Returns 0 = NTSC, 1 = PAL, -1 = unknown / not a ROM.
 int detect_rom_region_pal(const std::string& rom_path);
 
+// Upgrade a legacy snes9x 1.5.x save state (#!snes9x:NNNN with separate
+// APU/ARE/ARA/SOU/IAP/GBJ/SHO sections) to the modern v12 format
+// (#!s9xsnp:0012 with a unified SND section) that current snes9x builds can
+// load. Best-effort: SPC700 registers, DSP regs, timer state, and the
+// CPU<->SPC ports are extracted; mid-instruction state and DSP voice
+// internals are zeroed. Throws ConvertError if the input isn't a legacy
+// state. Output is gzipped just like a real snes9x .009.
+void upgrade_legacy_s9x_state(const std::string& in_path,
+                              const std::string& out_path);
+
 // Auto-name the output: insert _from_snes9x or _from_mesen2 before the extension.
 std::string tag_output_path(const std::string& path, const std::string& tag);
 

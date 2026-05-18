@@ -48,6 +48,18 @@ The window has two drop zones:
 Browse buttons exist for non-drag flow. After a successful conversion, the
 "Open output folder" button opens Explorer with the output selected.
 
+### Bonus: legacy snes9x 1.5.x → modern snes9x v12 upgrade
+
+Side A also has an **Upgrade legacy → v12** button that only enables when the
+dropped file uses the pre-v6 `#!snes9x:NNNN` header (snes9x 1.5.0 / 1.5.1
+era). Current snes9x builds can't load those states directly; clicking the
+button writes a `_upgraded` copy in the modern `#!s9xsnp:0012` format that
+modern snes9x will load. Best-effort: 65C816 / PPU / VRAM / WRAM / SRAM /
+FillRAM are exact; SPC700 registers + DSP regs + timers are extracted from
+the legacy `APU` / `ARE` / `IAP` sections; mid-instruction state and DSP
+voice internals are zeroed. Has nothing to do with mesen2 — pure snes9x
+format migration.
+
 ## Files
 
 | File                | Purpose                                           |

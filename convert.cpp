@@ -127,6 +127,87 @@ static void apply_forward_ppu(const S9xState& s9x, MssFile& mss) {
     mss.add_s16("ppu.mode7.centerY",   p.CentreY);
     mss.add_s16("ppu.mode7.hscroll",   p.M7HOFS);
     mss.add_s16("ppu.mode7.vscroll",   p.M7VOFS);
+
+    // The Category C derivations below depend on snes9x v6+ field layout +
+    // FillRAM being correctly synchronised with internal state. Legacy
+    // snes9x 1.5.x stored these registers in a different layout and
+    // sometimes left stale values in FillRAM (e.g. mid-DMA $420B markers).
+    // Writing those to mesen2 occasionally regresses an otherwise working
+    // legacy conversion. Skip for legacy — mesen2's defaults work better.
+    if (s9x.original_version >= 1000) return;
+
+    // --- Mode 7 flip / repeat flags ($211A bits) ---
+    // PPU.Mode7HFlip/VFlip/Repeat live at v12 PPU offsets 2570-2572.
+    if (s9x.section("PPU").size() >= 2652) {
+        uint8_t m7hflip = s9x.ppu_u8(2570);
+        uint8_t m7vflip = s9x.ppu_u8(2571);
+        uint8_t m7rep   = s9x.ppu_u8(2572);
+        mss.add_u8("ppu.mode7.horizontalMirroring", m7hflip & 1);
+        mss.add_u8("ppu.mode7.verticalMirroring",   m7vflip & 1);
+        // Mode7Repeat = (largeMap << 1) | fillWithTile0 (with 1 -> 0 remap on
+        // load, so the result is 0, 2, or 3 here).
+        mss.add_u8("ppu.mode7.fillWithTile0", (m7rep & 1) ? 1 : 0);
+        mss.add_u8("ppu.mode7.largeMap",     (m7rep & 2) ? 1 : 0);
+    }
+
+    // --- CGRAM write-pair toggle ---
+    // PPU.CGFLIP at PPU offset 60 (v12 schema, between BG3Priority and CGFLIPRead).
+    if (s9x.section("PPU").size() >= 61) {
+        mss.add_u8("ppu.cgramAddressLatch", s9x.ppu_u8(60) & 1);
+    }
+
+    // --- Sprite scan range ---
+    // PPU.FirstSprite/LastSprite at PPU offsets 2547/2548 (uint8 each in snes9x).
+    if (s9x.section("PPU").size() >= 2549) {
+        mss.add_u16("ppu.fetchSpriteStart", s9x.ppu_u8(2547));
+        mss.add_u16("ppu.fetchSpriteEnd",   s9x.ppu_u8(2548));
+    }
+
+    // --- Window edges (left/right) ---
+    // PPU.Window1Left/Right/Window2Left/Right at PPU offsets 2595-2598.
+    if (s9x.section("PPU").size() >= 2599) {
+        mss.add_u8("ppu.window[0].left",  s9x.ppu_u8(2595));
+        mss.add_u8("ppu.window[0].right", s9x.ppu_u8(2596));
+        mss.add_u8("ppu.window[1].left",  s9x.ppu_u8(2597));
+        mss.add_u8("ppu.window[1].right", s9x.ppu_u8(2598));
+    }
+
+    // --- Per-layer window active/inverted flags ---
+    // PPU.ClipWindow{1,2}{Enable,Inside}[L] at PPU offsets 2600+L*6 + {2,3,4,5}.
+    // L: 0=BG1, 1=BG2, 2=BG3, 3=BG4, 4=OBJ, 5=COLOR.
+    if (s9x.section("PPU").size() >= 2636) {
+        for (int L = 0; L < 6; ++L) {
+            int base = 2600 + L * 6;
+            char k[80];
+            std::snprintf(k, sizeof(k), "ppu.window[0].activeLayers[%d]", L);
+            mss.add_u8(k, s9x.ppu_u8(base + 2) & 1);
+            std::snprintf(k, sizeof(k), "ppu.window[1].activeLayers[%d]", L);
+            mss.add_u8(k, s9x.ppu_u8(base + 3) & 1);
+            std::snprintf(k, sizeof(k), "ppu.window[0].invertedLayers[%d]", L);
+            mss.add_u8(k, s9x.ppu_u8(base + 4) & 1);
+            std::snprintf(k, sizeof(k), "ppu.window[1].invertedLayers[%d]", L);
+            mss.add_u8(k, s9x.ppu_u8(base + 5) & 1);
+        }
+    }
+
+    // --- Main / sub screen window mask ($212E/$212F) ---
+    {
+        uint8_t tmw = s9x.fil(0x212E);
+        uint8_t tsw = s9x.fil(0x212F);
+        for (int L = 0; L < 5; ++L) {
+            char k[64];
+            std::snprintf(k, sizeof(k), "ppu.windowMaskMain[%d]", L);
+            mss.add_u8(k, (tmw >> L) & 1);
+            std::snprintf(k, sizeof(k), "ppu.windowMaskSub[%d]", L);
+            mss.add_u8(k, (tsw >> L) & 1);
+        }
+    }
+
+    // --- VRAM read prefetch buffer ---
+    mss.add_u16("ppu.vramReadBuffer", p.VRAMReadBuffer);
+
+    // --- Mode 7 ExtBg ($2133 bit 6) ---
+    mss.add_u8("ppu.extBgEnabled", (setini >> 6) & 1);
 }
 
 static void apply_forward_dma(const S9xState& s9x, MssFile& mss) {
@@ -179,6 +260,13 @@ static void apply_forward_dma(const S9xState& s9x, MssFile& mss) {
             mss.add_u8(k_at("dmaController.channel[%d].hdmaFinished"), 1);
         }
         mss.add_u8(k_at("dmaController.channel[%d].unusedRegister"), c.UnknownByte);
+        // dmaActive flag: only emit for modern states. Legacy 1.5.x states
+        // sometimes carry mid-DMA bookkeeping in FillRAM[$420B] that, when
+        // combined with an explicit dmaActive=0 override, makes mesen2's DMA
+        // scheduler hiccup. For legacy, leave the key absent so mesen2 picks
+        // its default.
+        if (s9x.original_version < 1000)
+            mss.add_u8(k_at("dmaController.channel[%d].dmaActive"), 0);
     }
     mss.add_u8("dmaController.hdmaChannels", s9x.fil(0x420C));
 }
@@ -195,6 +283,39 @@ static void apply_forward_internal_regs(const S9xState& s9x, MssFile& mss) {
     mss.add_u16("internalRegisters.verticalTimer",        vtime);
     mss.add_u8("internalRegisters.enableFastRom",        s9x.fil(0x420D) & 1);
     mss.add_u8("internalRegisters.ioPortOutput",         s9x.fil(0x4201));
+
+    // Category C additions only for modern states — see apply_forward_ppu
+    // comment. Legacy FillRAM can carry stale mid-cycle markers that confuse
+    // mesen2 when written verbatim.
+    if (s9x.original_version >= 1000) return;
+
+    // --- ALU multiply / divide operands and results ---
+    // $4202 multiplicand, $4203 multiplier, $4204-$4205 dividend, $4206 divisor,
+    // $4214-$4215 quotient, $4216-$4217 product/remainder.
+    mss.add_u8("internalRegisters.aluMulDiv.multOperand1", s9x.fil(0x4202));
+    mss.add_u8("internalRegisters.aluMulDiv.multOperand2", s9x.fil(0x4203));
+    mss.add_u16("internalRegisters.aluMulDiv.dividend",     s9x.fil(0x4204) | (s9x.fil(0x4205) << 8));
+    mss.add_u8("internalRegisters.aluMulDiv.divisor",      s9x.fil(0x4206));
+    mss.add_u16("internalRegisters.aluMulDiv.divResult",                 s9x.fil(0x4214) | (s9x.fil(0x4215) << 8));
+    mss.add_u16("internalRegisters.aluMulDiv.multOrRemainderResult",     s9x.fil(0x4216) | (s9x.fil(0x4217) << 8));
+
+    // --- Joypad auto-read shadow ($4218-$421F → controllerData[0..3]) ---
+    for (int n = 0; n < 4; ++n) {
+        uint32_t lo = s9x.fil(0x4218 + n * 2);
+        uint32_t hi = s9x.fil(0x4219 + n * 2);
+        char k[64];
+        std::snprintf(k, sizeof(k), "internalRegisters.controllerData[%d]", n);
+        mss.add_u16(k, lo | (hi << 8));
+    }
+
+    // --- Memory bus state ---
+    // cpuSpeed: 6 cycles per access in FastROM regions when enabled, 8 otherwise.
+    mss.add_u8("memoryManager.cpuSpeed",          (s9x.fil(0x420D) & 1) ? 6 : 8);
+    // dramRefreshPosition: NTSC default; PAL still uses the same constant.
+    mss.add_u16("memoryManager.dramRefreshPosition", 538);
+    // openBus: snes9x doesn't keep this in FillRAM directly. $FF is a safe
+    // default — the bus float on most reads of unmapped space.
+    mss.add_u8("memoryManager.openBus", 0xFF);
 }
 
 static void apply_forward_cpu_timing(const S9xState& s9x, MssFile& mss) {
@@ -286,8 +407,12 @@ static void apply_forward_smp_legacy(const S9xState& s9x, MssFile& mss) {
         mss.add_u8 ("spc.x",  are[2]);
         mss.add_u8 ("spc.sp", are[3]);
         mss.add_u8 ("spc.ps", are[4]);
-        uint16_t pc = (uint16_t(are[5]) << 8) | are[6];
-        mss.add_u16("spc.pc", pc);
+        // Saved PC is preserved in comments only — we redirect SMP to the
+        // echo loop planted at $1947 in spc.ram (see convert_s9x_to_mss SND
+        // handling for the loop bytes and rationale). The original ARE PC
+        // would land back in the deadlocked upload routine and freeze.
+        // uint16_t saved_pc = (uint16_t(are[5]) << 8) | are[6];
+        mss.add_u16("spc.pc", uint16_t(0x1947));
     }
 
     // SAPU section (snes9x 1.5.1 SAPU struct, big-endian INT_V serialisation):
@@ -295,26 +420,56 @@ static void apply_forward_smp_legacy(const S9xState& s9x, MssFile& mss) {
     //   [4]      ShowROM (bool8) — $F1 bit 7, IPL ROM visibility
     //   [5]      Flags
     //   [6]      KeyedChannels
-    //   [7..10]  OutPorts[0..3] — SPC -> CPU ports. THIS is what the CPU reads
-    //            at $2140-$2143, NOT apuram[$F4..$F7]. In Blargg APU the two
-    //            directions use separate storage: apuram[$F4..$F7] holds the
-    //            CPU's last writes (SPC's read view), OutPorts holds the SPC's
-    //            last writes (CPU's read view). Modern bAPU collapsed those
-    //            into apuram[$F4..$F7] for the SPC-write side, which is why
-    //            the default forward-direction code (line ~408) writes
-    //            spc.outputReg from snd[$F4..$F7] — correct for modern, wrong
-    //            for legacy. Override here.
+    //   [7..10]  OutPorts[0..3] — SPC's last writes (in Blargg APU's separate
+    //            storage). We *don't* use these here because the CPU side in
+    //            v1.5.1 actually reads $2140-$2143 from apuram[$F4..$F7]
+    //            (the two directions ended up unified at the apuram level
+    //            through how Blargg APU implemented port writes; OutPorts is
+    //            best-effort scratch). Whatever the CPU was last reading is
+    //            sitting in apuram[$F4..$F7], which the line-~408 write
+    //            already pushed into spc.outputReg. Leaving that alone is
+    //            what makes the post-load $2140 echo satisfy a typical
+    //            CPU "wait for command ack" spinloop.
     auto apu_it = s9x.sections.find("APU");
-    if (apu_it != s9x.sections.end() && apu_it->second.size() >= 11) {
+    if (apu_it != s9x.sections.end() && apu_it->second.size() >= 221) {
         const auto& apu = apu_it->second;
         mss.add_u8("spc.romEnabled",     apu[4] ? 1 : 0);
         mss.add_u8("spc.timersEnabled",  1);   // best-effort
         mss.add_u8("spc.timersDisabled", 0);
-        for (int i = 0; i < 4; ++i) {
-            char k[40];
-            std::snprintf(k, sizeof(k), "spc.outputReg[%d]", i);
-            mss.add_u8(k, apu[7 + i]);   // SPC -> CPU (CPU reads $2140-$2143)
+
+        // Per-timer state. Same offsets as the upgrade path (Timer at 206,
+        // TimerTarget at 212, TimerEnabled at 218 — empirically verified
+        // from Yoshi's music-tick target=$10 at offset 213).
+        for (int t = 0; t < 3; ++t) {
+            char k[64];
+            uint16_t timer_now = (uint16_t(apu[206 + t * 2]) << 8) | apu[207 + t * 2];
+            uint16_t target    = (uint16_t(apu[212 + t * 2]) << 8) | apu[213 + t * 2];
+            uint8_t  enabled   = apu[218 + t];
+            std::snprintf(k, sizeof(k), "spc.timer%d.enabled",       t);
+            mss.add_u8(k, enabled);
+            std::snprintf(k, sizeof(k), "spc.timer%d.timersEnabled", t);
+            mss.add_u8(k, 1);
+            std::snprintf(k, sizeof(k), "spc.timer%d.target",        t);
+            mss.add_u8(k, uint8_t(target));
+            std::snprintf(k, sizeof(k), "spc.timer%d.stage0",        t);
+            mss.add_u8(k, uint8_t(timer_now));
+            std::snprintf(k, sizeof(k), "spc.timer%d.stage2",        t);
+            mss.add_u8(k, 0);
+            std::snprintf(k, sizeof(k), "spc.timer%d.output",        t);
+            mss.add_u8(k, 0);
         }
+
+        // DSP register bank (128 bytes at APU offset 11) — modern bAPU loads
+        // these via mesen2's `spc.dsp.regs` key.
+        if (apu.size() >= 11 + 128) {
+            Bytes dsp_regs(apu.begin() + 11, apu.begin() + 11 + 128);
+            mss.add_entry("spc.dsp.regs", dsp_regs);
+        }
+
+        // DSP register address latch ($F2 register).
+        const Bytes& snd2 = s9x.section("SND");
+        if (snd2.size() >= 0xF3)
+            mss.add_u8("spc.dspReg", snd2[0xF2]);
     }
 
     // CPU -> SPC ports. In legacy Blargg APU these live in apuram[$F4..$F7]
@@ -484,11 +639,78 @@ void convert_s9x_to_mss(const std::string& in_path, const std::string& out_path)
         const Bytes& snd = s9x.section("SND");
         if (snd.size() >= 65536) {
             Bytes spc_ram(snd.begin(), snd.begin() + 65536);
+
+            // Legacy unstick hack: the SNES IPL-style upload protocol contains
+            // a `MOV Y, !CPUIO0; BNE -3` busy-wait that depends on cycle-precise
+            // CPU<->SPC sync the legacy snes9x 1.5.x state didn't preserve. If
+            // the state was captured mid-upload, both sides deadlock at the
+            // wait point. Patch every occurrence of the wait pattern so the
+            // SPC unconditionally falls through into the inner CMP/echo loop;
+            // it'll then echo whatever Y currently holds and let the CPU's
+            // matching wait satisfy. The cost: real subsequent uploads (e.g.
+            // game changing music) skip the "wait for byte index 0" sync, so
+            // the first upload after load may glitch. Subsequent ones still
+            // work because each upload reissues the protocol code from scratch.
+            //
+            // Pattern: `EC F4 00 D0 FB`
+            //   $XX+0:  EC F4 00    MOV Y, !$00F4   (read CPUIO0)
+            //   $XX+3:  D0 FB       BNE  $XX        (loop if non-zero)
+            // Replace D0 FB -> 2F 00: BRA +0 = unconditional fall-through.
+            if (s9x.original_version >= 1000) {
+                int patches = 0;
+                for (size_t i = 0; i + 4 < spc_ram.size(); ++i) {
+                    if (spc_ram[i  ] == 0xEC && spc_ram[i+1] == 0xF4 &&
+                        spc_ram[i+2] == 0x00 && spc_ram[i+3] == 0xD0 &&
+                        spc_ram[i+4] == 0xFB) {
+                        spc_ram[i+3] = 0x2F;
+                        spc_ram[i+4] = 0x00;
+                        ++patches;
+                        if (patches >= 16) break; // sanity cap
+                    }
+                }
+
+                // Plant the same SPC echo loop the legacy->v12 upgrade path
+                // uses (see upgrade_legacy_s9x_state step 7). SPC reads each
+                // cpu.registers[N] (CPU's write to $2140+N) and immediately
+                // copies it into apuram[$F4+N] so the CPU's `CMP $2140 / BNE`
+                // echo-waits in mid-handshake legacy states satisfy on every
+                // iteration without needing cycle-precise SPC sync. Audio is
+                // sacrificed; the alternative is a hard freeze.
+                static const uint8_t echo_loop[] = {
+                    0xE5, 0xF4, 0x00,  // MOV A, !$F4
+                    0xC5, 0xF4, 0x00,  // MOV !$F4, A
+                    0xE5, 0xF5, 0x00,  // MOV A, !$F5
+                    0xC5, 0xF5, 0x00,  // MOV !$F5, A
+                    0xE5, 0xF6, 0x00,  // MOV A, !$F6
+                    0xC5, 0xF6, 0x00,  // MOV !$F6, A
+                    0xE5, 0xF7, 0x00,  // MOV A, !$F7
+                    0xC5, 0xF7, 0x00,  // MOV !$F7, A
+                    0x2F, 0xE6,        // BRA $1947 (-26)
+                };
+                const size_t echo_addr = 0x1947;
+                if (echo_addr + sizeof(echo_loop) <= spc_ram.size())
+                    std::memcpy(&spc_ram[echo_addr], echo_loop, sizeof(echo_loop));
+
+                // Override the SPC PC (set by apply_forward_smp_legacy from
+                // ARE bytes 5-6) so SMP runs the echo loop on resume.
+                mss.add_u16("spc.pc", uint16_t(echo_addr));
+            }
+
             mss.add_entry("spc.ram", spc_ram);
             for (int i = 0; i < 4; ++i) {
                 char k[40];
                 std::snprintf(k, sizeof(k), "spc.outputReg[%d]", i);
-                mss.add_u8(k, snd[0xF4 + i]);
+                // Legacy mid-upload states deadlock the CPU's `LDA $214X ;
+                // BNE -3` post-upload-ack waits because legacy apuram[$F4..$F7]
+                // carries the CPU's last-written command byte rather than the
+                // SPC's echo byte the CPU is polling for. Zero the CPU-visible
+                // ports so all such waits satisfy on resume — same fix the
+                // legacy->v12 upgrade path applies (see upgrade_legacy_s9x_state
+                // step 7). For modern snes9x states the apuram value is already
+                // a correct SPC->CPU snapshot, leave it alone.
+                uint8_t v = (s9x.original_version >= 1000) ? uint8_t(0)
+                                                           : snd[0xF4 + i];
+                mss.add_u8(k, v);
             }
         }
         if (s9x.original_version >= 8 && snd.size() > 65536) {
@@ -1407,6 +1629,219 @@ void convert_mss_to_s9x(const std::string& in_path, const std::string& out_path,
     overlay_fil(s9x.section("FIL"), mss);
     overlay_snd(s9x.section("SND"), mss);
 
+    s9x.save(out_path);
+}
+
+// ===== Legacy snes9x 1.5.x -> modern snes9x v12 upgrade ==================
+//
+// S9xState::load already normalises CPU/PPU/TIM to v6 layout and synthesises
+// a 64 KB-only SND from the legacy ARA section, leaving the rest of the SND
+// (SMP state, DSP regs, ports) zeroed. We need to fill those in from the
+// legacy APU / ARE / IAP sections so modern snes9x can resume the SPC.
+
+void upgrade_legacy_s9x_state(const std::string& in_path,
+                              const std::string& out_path) {
+    S9xState s9x = S9xState::load(in_path);
+    if (s9x.original_version < 1000)
+        throw ConvertError("not a legacy snes9x 1.5.x state — already in a modern format snes9x can load");
+
+    if (!s9x.sections.count("SND"))
+        throw ConvertError("legacy state has no synthesised SND — load logic regression?");
+
+    Bytes& snd = s9x.section("SND");
+    if (snd.size() < 66358)
+        snd.resize(66560, 0);
+
+    auto apu_it = s9x.sections.find("APU");
+    auto are_it = s9x.sections.find("ARE");
+
+    // 1. SPC <-> CPU port plumbing. Earlier versions swapped apuram[$F4..$F7]
+    //    with SAPU.OutPorts on the theory that legacy / modern stored the two
+    //    directions on different sides. In practice the CPU side at save time
+    //    was polling $2140 for the value sitting in legacy apuram[$F4..$F7]
+    //    (e.g. $1B for Yoshi's Safari) — which means whatever model legacy
+    //    used, that byte IS what the CPU expects to read after resume. Modern
+    //    bAPU's CPU-side $2140 read returns apuram[$F4], so leave the legacy
+    //    apuram bytes alone and mirror them into cpu.registers (= what the
+    //    SPC reads at $F4 MMIO) below in step 5. Without this the upgraded
+    //    state immediately deadlocks: CPU reads $2140=$00 (from SAPU.OutPorts)
+    //    but is comparing against A.low=$1B.
+    uint8_t legacy_apuram_F4_F7[4] = { snd[0xF4], snd[0xF5], snd[0xF6], snd[0xF7] };
+
+    // 2. SMP state (41 LE int32) at offset 65536.
+    //    ARE layout (snes9x 1.5.1 SAPURegisters, big-endian INT_V):
+    //      [0..1] YA (Y high, A low) — byte 0 = Y, byte 1 = A
+    //      [2]    X
+    //      [3]    S (stack pointer)
+    //      [4]    P (PSW)
+    //      [5..6] PC (big-endian)
+    if (are_it != s9x.sections.end() && are_it->second.size() >= 7
+        && snd.size() >= 65536 + 41 * 4) {
+        const auto& are = are_it->second;
+        int32_t smp[41] = {0};
+        smp[3] = (int32_t(are[5]) << 8) | are[6];   // REG_PC
+        smp[4] = are[3];                            // REG_SP
+        smp[5] = are[1];                            // REG_A
+        smp[6] = are[2];                            // REG_X
+        smp[7] = are[0];                            // REG_Y
+        uint8_t psw = are[4];
+        smp[8]  = (psw >> 7) & 1;   // P_N
+        smp[9]  = (psw >> 6) & 1;   // P_V
+        smp[10] = (psw >> 5) & 1;   // P_P
+        smp[11] = (psw >> 4) & 1;   // P_B
+        smp[12] = (psw >> 3) & 1;   // P_H
+        smp[13] = (psw >> 2) & 1;   // P_I
+        smp[14] = (psw >> 1) & 1;   // P_Z
+        smp[15] = psw & 1;          // P_C
+
+        if (apu_it != s9x.sections.end() && apu_it->second.size() >= 11) {
+            smp[16] = apu_it->second[4] ? 1 : 0;    // STATUS_IPLROM_ENABLE
+        }
+        // STATUS_DSP_ADDR: last value written to SPC $F2 (DSP address latch).
+        // Legacy Blargg APU stored this in apuram[$F2]; modern bAPU keeps it
+        // in status.dsp_addr (= SMP state index 17). Source the latch byte
+        // from our synthesised apuram which still holds the legacy $F2.
+        smp[17] = snd[0xF2];                        // STATUS_DSP_ADDR
+        smp[18] = snd[0xF8];                        // STATUS_RAM00F8
+        smp[19] = snd[0xF9];                        // STATUS_RAM00F9
+
+        // Timers from SAPU. Empirically verified by finding Yoshi's music-tick
+        // target=$0010 at offset 213 (so TimerTarget[0] BE is at 212-213).
+        // The legacy struct has 3 bytes of padding/uninitialised ExtraRAM
+        // tail between byte 202 and the Timer array (despite the documented
+        // ExtraRAM[64] suggesting Timer starts at 203). Actual layout:
+        //   [206..211] Timer[3]        (3 x uint16 BE — current counter)
+        //   [212..217] TimerTarget[3]  (3 x uint16 BE — target)
+        //   [218..220] TimerEnabled[3] (3 x bool8)
+        if (apu_it != s9x.sections.end() && apu_it->second.size() >= 221) {
+            const auto& apu = apu_it->second;
+            static const int T_BASE[3] = { 20, 25, 30 };
+            for (int t = 0; t < 3; ++t) {
+                int32_t timer_now = (int32_t(apu[206 + t * 2]) << 8) | apu[207 + t * 2];
+                int32_t target    = (int32_t(apu[212 + t * 2]) << 8) | apu[213 + t * 2];
+                int b = T_BASE[t];
+                smp[b + 0] = apu[218 + t];  // T?_ENABLE
+                smp[b + 1] = target;        // T?_TARGET
+                smp[b + 2] = timer_now;     // T?_STAGE1 (current counter)
+                smp[b + 3] = 0;             // T?_STAGE2
+                smp[b + 4] = 0;             // T?_STAGE3 (4-bit output)
+            }
+        }
+
+        for (int i = 0; i < 41; ++i)
+            wr_u32_le(&snd[65536 + i * 4], uint32_t(smp[i]));
+    }
+
+    // 3. DSP register bank (128 bytes) at offset 65700.
+    //    Legacy SAPU.DSP[128] sits at APU offset 11.
+    if (apu_it != s9x.sections.end() && apu_it->second.size() >= 11 + 128
+        && snd.size() >= 65700 + 128) {
+        std::memcpy(&snd[65700], &apu_it->second[11], 128);
+    }
+
+    // 4. DSP voice state (8 * 38 bytes from offset 65828): zero with safe
+    //    brrOffset = 1 to avoid the SPC_DSP voice_V3 assertion in snes9x.
+    {
+        const size_t voice_base = 65828;
+        for (int v = 0; v < 8; ++v) {
+            size_t vo = voice_base + v * 38;
+            if (vo + 38 > snd.size()) break;
+            std::memset(&snd[vo], 0, 38);
+            snd[vo + 33] = 1;
+        }
+    }
+
+    // 5. cpu.registers[4] at offset 66354 = CPU->SPC ports. Legacy held
+    //    these in apuram[$F4..$F7] (CPU's writes); we saved those before
+    //    overwriting apuram with SAPU.OutPorts in step 1.
+    if (snd.size() >= 66358) {
+        snd[66354] = legacy_apuram_F4_F7[0];
+        snd[66355] = legacy_apuram_F4_F7[1];
+        snd[66356] = legacy_apuram_F4_F7[2];
+        snd[66357] = legacy_apuram_F4_F7[3];
+    }
+
+    // 6. Apply the same SPC-busy-wait unstick patch the mss path uses.
+    //    Legacy snes9x 1.5.x states often catch the SPC in the SNES IPL-style
+    //    "MOV Y, !CPUIO0 ; BNE -3" upload wait. Modern snes9x doesn't capture
+    //    cycle-precise CPU<->SPC sync either (same as mesen2), so without
+    //    patching the SPC also deadlocks on load. Replace every occurrence of
+    //    the wait pattern (D0 FB after EC F4 00) with BRA +0 (2F 00) so the
+    //    SPC falls through into the inner CMP/echo loop at $1947 instead of
+    //    spinning at the outer wait.
+    {
+        int patches = 0;
+        for (size_t i = 0; i + 4 < snd.size() && i + 4 < 65536; ++i) {
+            if (snd[i]   == 0xEC && snd[i+1] == 0xF4 &&
+                snd[i+2] == 0x00 && snd[i+3] == 0xD0 &&
+                snd[i+4] == 0xFB) {
+                snd[i+3] = 0x2F;
+                snd[i+4] = 0x00;
+                if (++patches >= 16) break;
+            }
+        }
+    }
+
+    // 7. Plant an SPC-side echo loop in apuram and force SMP PC to it.
+    //    Legacy 1.5.x states often capture the CPU mid-audio-upload where
+    //    the standard wait pattern is:
+    //
+    //        STA $2140                ; send byte
+    //        ...
+    //        CMP $2140  ; CD 40 21    ; wait for SPC to echo it back
+    //        BNE -3     ; D0 FB
+    //
+    //    Each iteration polls for a *different* echo value (the bytes
+    //    shift through A.low via XBA + LDA [$91],Y + INC A), so no single
+    //    state-side apuram value satisfies all the waits. The SPC code
+    //    that would echo is itself stuck in a mid-byte loop because the
+    //    cycle-precise CPU<->SPC sync legacy snes9x didn't preserve.
+    //
+    //    Bypass the whole mess by replacing the broken SPC routine with a
+    //    tight echo loop: SPC reads each cpu.registers[N] (CPU's write to
+    //    $2140+N) and immediately copies it into apuram[$F4+N] (what CPU
+    //    reads at $2140+N). The CPU's CMP/BNE waits satisfy within ~32
+    //    SPC cycles. Audio is lost — the alternative is a hard freeze.
+    //
+    //    $1947 is chosen because it's where Yoshi's Safari's mid-upload
+    //    routine sits (and similarly-stuck states tend to land in the
+    //    same upload-protocol area of apuram); overwriting it is safe
+    //    because that routine is already deadlocked.
+    {
+        static const uint8_t echo_loop[] = {
+            0xE5, 0xF4, 0x00,  // MOV A, !$F4
+            0xC5, 0xF4, 0x00,  // MOV !$F4, A
+            0xE5, 0xF5, 0x00,  // MOV A, !$F5
+            0xC5, 0xF5, 0x00,  // MOV !$F5, A
+            0xE5, 0xF6, 0x00,  // MOV A, !$F6
+            0xC5, 0xF6, 0x00,  // MOV !$F6, A
+            0xE5, 0xF7, 0x00,  // MOV A, !$F7
+            0xC5, 0xF7, 0x00,  // MOV !$F7, A
+            0x2F, 0xE6,        // BRA $1947 (-26)
+        };
+        const size_t echo_addr = 0x1947;
+        if (echo_addr + sizeof(echo_loop) <= 65536)
+            std::memcpy(&snd[echo_addr], echo_loop, sizeof(echo_loop));
+
+        // Override SMP PC (smp state int32[3], at SND offset 65536+12=65548).
+        if (snd.size() >= 65552)
+            wr_u32_le(&snd[65548], uint32_t(echo_addr));
+    }
+
+    // Keep apuram[$F4..$F7] zeroed at boot so the very first CPU CMP after
+    // resume reads 0; the echo loop above repopulates them with valid
+    // values once SPC executes its first iteration.
+    snd[0xF4] = 0;
+    snd[0xF5] = 0;
+    snd[0xF6] = 0;
+    snd[0xF7] = 0;
+
+    // 8. Drop the legacy-only sections so save() emits a clean modern state.
+    for (const char* tag : { "APU", "ARE", "IAP", "SOU" })
+        s9x.sections.erase(tag);
+
+    s9x.version = 12;
+    s9x.original_version = 12;
     s9x.save(out_path);
 }
 

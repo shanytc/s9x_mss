@@ -32,15 +32,85 @@ const int PPU_OAMDATA_OFF = PPU_CGDATA_OFF + 512 + PPU_OBJ_LEN
 //        contents on first frame, audio glitches briefly but the game advances.
 static Bytes upgrade_legacy_section(const std::string& tag, Bytes raw) {
     if (tag == "CPU" && raw.size() == 58) {
-        raw.resize(56);
-        return raw;
+        // Legacy snes9x 1.5.x CPU section uses a different in-memory layout
+        // than v6: bytes 0..15 (Cycles, PrevCycles, V_Counter, Flags) match,
+        // but bytes 16+ in legacy are PACKED differently (no CPU_IRQActive
+        // pad byte at 16, different IRQPending position, plus serialised
+        // pointers like WaitAddress that don't survive cross-build). Just
+        // truncating to 56 bytes feeds garbage to the v6 -> v12 promoter
+        // (symptom: MemSpeed = 1536, NextEvent = -240, etc.) which makes
+        // modern snes9x deadlock on load. Rebuild the section in v6 layout
+        // with the safe fields we can confidently copy from legacy + sane
+        // defaults for everything else. snes9x re-derives most CPU
+        // scheduling state on the first frame post-load, so defaults are
+        // fine for those fields.
+        Bytes v6cpu(56, 0);
+        // Bytes 0..15: Cycles, PrevCycles, V_Counter, Flags — compatible across versions.
+        std::memcpy(&v6cpu[0], &raw[0], 16);
+        // Byte 16: CPU_IRQActive (v6 obsolete byte, stripped by v6 -> v12 promoter).
+        v6cpu[16] = 0;
+        // Bytes 17..20: IRQPending — leave 0; legacy IRQ state is unreliable
+        // and snes9x re-derives from FillRAM on first frame.
+        // Bytes 21..24: MemSpeed = SLOW_ONE_CYCLE (8 cycles, byte-swapped int32 BE).
+        v6cpu[24] = 8;
+        // Bytes 25..28: MemSpeedx2 = 16.
+        v6cpu[28] = 16;
+        // Bytes 29..32: FastROMSpeed = ONE_CYCLE (6).
+        v6cpu[32] = 6;
+        // Bytes 33..37: InDMA/InHDMA/InDMAorHDMA/InWRAMDMAorHDMA/HDMARanInDMA — all 0.
+        // Byte 38: WhichEvent = HC_RENDER_EVENT (5) — safe scheduler entry point.
+        v6cpu[38] = 5;
+        // Bytes 39..42: NextEvent = Timings.RenderPos = 512 (int32 BE).
+        v6cpu[39] = 0; v6cpu[40] = 0; v6cpu[41] = 0x02; v6cpu[42] = 0x00;
+        // Byte 43: WaitingForInterrupt — 0 (most legacy states aren't mid-WAI).
+        // Bytes 44..55: v6 obsolete WaitAddress/WaitCounter/PBPCAtOpcodeStart — 0,
+        // stripped by v6 -> v12 promoter anyway.
+        return v6cpu;
     }
     if (tag == "TIM" && raw.size() == 57) {
-        // Legacy TIM = v6 TIM (61 B) minus the trailing APUSpeedup (4 B).
-        // Append 4 zero bytes for APUSpeedup so the result matches the v6
-        // size; the v6 -> v12 promoter then appends IRQTriggerCycles +
-        // APUAllowTimeOverflow + NextIRQTimer the rest of the way.
-        raw.insert(raw.end(), {0, 0, 0, 0});
+        // Legacy snes9x 1.5.x stored different live timing state in TIM
+        // bytes 44..56 (DMACPUSync=18 OK, but NMIDMADelay had garbage like
+        // $0002A171 and IRQFlagChanging had $12AE — clearly not the modern
+        // semantics). RenderPos at offset 40-43 also differed (192 vs 512).
+        // Build a clean v6 TIM (61 bytes) with safe modern constants and
+        // copy ONLY the first 8 fields from legacy (H_Max_Master..HDMAStart,
+        // which are dimensions of the scanline and identical across versions).
+        // The v6 -> v12 promoter then appends IRQTriggerCycles +
+        // APUAllowTimeOverflow + NextIRQTimer.
+        Bytes v6tim(61, 0);
+        // bytes 0..31: H_Max_Master..HDMAStart (8 int32 BE constants) from legacy.
+        std::memcpy(&v6tim[0], &raw[0], 32);
+        // bytes 32-35: NMITriggerPos = 0xFFFF (no NMI pending).
+        v6tim[34] = 0xFF; v6tim[35] = 0xFF;
+        // bytes 36-39: WRAMRefreshPos = 538.
+        v6tim[37] = 0x02; v6tim[38] = 0x1A;
+        // bytes 40-43: RenderPos = 512 (modern SNES_RENDER_START_HC).
+        v6tim[42] = 0x02;
+        // byte 44: InterlaceField = 0.
+        // bytes 45-48: DMACPUSync = 18.
+        v6tim[48] = 18;
+        // bytes 49-52: NMIDMADelay = 24.
+        v6tim[52] = 24;
+        // bytes 53-56: IRQFlagChanging = 0 (already).
+        // bytes 57-60: APUSpeedup = 0 (already, will be added by v6->v12 promoter
+        //              via the IRQTriggerCycles append).
+        return v6tim;
+    }
+    if (tag == "CTL" && raw.size() == 86) {
+        // Legacy CTL (snes9x 1.5.x): 86 bytes, ver byte = 3 at offset 0.
+        // Modern snes9x v12 expects 91 bytes with ver byte = 4 and a trailing
+        // internal_macs[5] field that debuted in v10. Three things to fix:
+        //   - Bump ver byte 0 from 3 to 4 (modern loader checks this).
+        //   - Zero out internal[60] at offset 26..85 — that's the controller
+        //     state machine's mid-scan bookkeeping; the legacy layout doesn't
+        //     match modern bit-for-bit, and snes9x re-populates these on the
+        //     next auto-joypad pass anyway.
+        //   - Append 5 zero bytes for internal_macs[5].
+        // Without this the SControlSnapshot loader sees a stale version /
+        // garbage state and the auto-joypad path locks the CPU immediately.
+        raw[0] = 4;
+        std::memset(&raw[26], 0, 60);
+        raw.insert(raw.end(), {0, 0, 0, 0, 0});
         return raw;
     }
     return raw;
@@ -169,11 +239,21 @@ S9xState S9xState::load(const std::string& path) {
     if (legacy) {
         // Normalise sections that have a different byte size from their v6
         // equivalent. After this the v6 -> v12 promoter below handles the rest.
-        for (const char* tag : {"CPU", "TIM"}) {
+        for (const char* tag : {"CPU", "TIM", "CTL"}) {
             auto it = st.sections.find(tag);
             if (it != st.sections.end())
                 it->second = upgrade_legacy_section(tag, std::move(it->second));
         }
+        // Pad SRA to 512 KB. Legacy snes9x always wrote 128 KB regardless of
+        // the cartridge's actual SRAM size; modern snes9x reads up to
+        // Memory.SRAM_SIZE bytes (which is 512 KB for games like Yoshi's
+        // Safari) and zero-fills the partial read, which leaves the upper
+        // SRAM at zeros and can crash games that rely on data there. Pad to
+        // 512 KB so any SRAM_SIZE up to 4 Mbit works; snes9x will read only
+        // what its cartridge declares and discard the rest.
+        auto sra_it = st.sections.find("SRA");
+        if (sra_it != st.sections.end() && sra_it->second.size() < 0x80000)
+            sra_it->second.resize(0x80000, 0);
         // Synthesise SND from the legacy ARA (apuram) section. SMP, DSP and
         // CPU-port state are zeroed — snes9x will reboot the SPC from apuram
         // contents on the first frame after load. Audio glitches briefly but

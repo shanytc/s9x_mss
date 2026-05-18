@@ -34,6 +34,7 @@ enum {
     ID_REGION_B     = 1007,
     ID_ROM_BROWSE_B = 1008,
     ID_ROM_CLEAR_B  = 1009,
+    ID_UPGRADE_A    = 1010,
 };
 
 // ---- per-pane state ----
@@ -44,6 +45,10 @@ struct Pane {
     HWND browse    = nullptr;
     HWND convert   = nullptr;
     HWND open_out  = nullptr;
+
+    // Side A only — upgrade legacy snes9x 1.5.x to modern format
+    HWND upgrade   = nullptr;
+    bool is_legacy = false;
 
     // Side B only — region selector + optional ROM path for accurate region detection.
     HWND region_label  = nullptr;
@@ -94,7 +99,9 @@ static void set_status(Pane& p, const std::wstring& text) {
 static void load_file(Pane& p, const std::wstring& path, bool forward) {
     p.input_path = path;
     p.loaded = false;
+    p.is_legacy = false;
     EnableWindow(p.convert, FALSE);
+    if (p.upgrade) EnableWindow(p.upgrade, FALSE);
 
     std::string utf8 = from_w(path);
     std::wstring fname = fs::path(path).filename().wstring();
@@ -119,6 +126,14 @@ static void load_file(Pane& p, const std::wstring& path, bool forward) {
     set_status(p, L"Ready. Click Convert.");
     p.loaded = true;
     EnableWindow(p.convert, TRUE);
+
+    // Side A: enable the legacy upgrade button if the file uses the
+    // pre-v6 "#!snes9x:NNNN" magic. probe_s9x signals this by storing the
+    // version 1500/1510/... range; the label also contains "legacy".
+    if (forward && p.upgrade) {
+        p.is_legacy = (r.version >= 1000);
+        EnableWindow(p.upgrade, p.is_legacy ? TRUE : FALSE);
+    }
 }
 
 static void run_conversion(Pane& p, bool forward) {
@@ -190,6 +205,36 @@ static void browse_for(Pane& p, bool forward) {
     if (GetOpenFileNameW(&ofn)) {
         load_file(p, buf, forward);
     }
+}
+
+static void run_upgrade(Pane& p) {
+    if (!p.loaded || !p.is_legacy || p.input_path.empty()) return;
+
+    std::string in_utf8 = from_w(p.input_path);
+    fs::path q(in_utf8);
+    std::string stem = q.stem().string();
+    std::string ext  = q.extension().string();
+    if (ext.empty()) ext = ".000";
+    std::string tag  = "_upgraded";
+    if (stem.find(tag) == std::string::npos) stem += tag;
+    std::string out_utf8 = (q.parent_path() / (stem + ext)).string();
+
+    set_status(p, L"Upgrading...");
+    RedrawWindow(p.status, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+
+    try {
+        upgrade_legacy_s9x_state(in_utf8, out_utf8);
+    } catch (const std::exception& e) {
+        set_status(p, L"Error: " + to_w(e.what()));
+        EnableWindow(p.open_out, FALSE);
+        return;
+    }
+
+    p.last_output_path = to_w(out_utf8);
+    std::wstring msg = L"Upgraded: ";
+    msg += fs::path(p.last_output_path).filename().wstring();
+    set_status(p, msg);
+    EnableWindow(p.open_out, TRUE);
 }
 
 static void update_rom_label(Pane& p) {
@@ -326,8 +371,13 @@ static void layout_pane(const Pane& p, HWND title, int x, int top_y,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         y += ROW_STATUS;
     } else {
-        // Pane A has no region row; advance Y past the same vertical span so its
-        // bottom buttons sit at the same height as pane B's.
+        // Pane A has no region row; instead use the equivalent vertical
+        // span for the legacy-upgrade button (when present), then a blank
+        // status-height gap so its bottom buttons sit at the same y as Side B.
+        if (p.upgrade) {
+            SetWindowPos(p.upgrade, nullptr, x + 8, y, 200, ROW_BUTTONS,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         y += ROW_BUTTONS + GAP + ROW_STATUS;
     }
     y += GAP;
@@ -341,7 +391,8 @@ static void layout_pane(const Pane& p, HWND title, int x, int top_y,
 
 static void create_pane(HWND parent, Pane& p, const wchar_t* drop_text,
                         int browse_id, int convert_id, int open_id,
-                        bool with_region_controls = false) {
+                        bool with_region_controls = false,
+                        bool with_upgrade_button = false) {
     HINSTANCE hi = GetModuleHandleW(nullptr);
     // SS_CENTER (no SS_CENTERIMAGE) lets the static control wrap long text;
     // SS_CENTERIMAGE would force a single line and clip the right side.
@@ -380,6 +431,18 @@ static void create_pane(HWND parent, Pane& p, const wchar_t* drop_text,
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
         0, 0, 180, 32, parent, HMENU(intptr_t(open_id)), hi, nullptr);
     SendMessageW(p.open_out, WM_SETFONT, WPARAM(g_font_norm), TRUE);
+
+    if (with_upgrade_button) {
+        // Upgrade legacy snes9x 1.5.x ('#!snes9x:NNNN') states to the modern
+        // v12 format that current snes9x can load. Stays disabled unless the
+        // dropped file's magic matches that legacy header.
+        p.upgrade = CreateWindowExW(0, L"BUTTON",
+            L"Upgrade legacy → v12",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+            0, 0, 160, 32, parent,
+            HMENU(intptr_t(ID_UPGRADE_A)), hi, nullptr);
+        SendMessageW(p.upgrade, WM_SETFONT, WPARAM(g_font_norm), TRUE);
+    }
 
     if (with_region_controls) {
         p.region_label = CreateWindowExW(0, L"STATIC", L"Region:",
@@ -446,7 +509,9 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         create_pane(h, g_a,
             L"\nDrop SNES9x save state here\n\n"
             L"Any extension - validated by header",
-            ID_BROWSE_A, ID_CONVERT_A, ID_OPEN_OUT_A);
+            ID_BROWSE_A, ID_CONVERT_A, ID_OPEN_OUT_A,
+            /*with_region_controls=*/false,
+            /*with_upgrade_button=*/true);
         create_pane(h, g_b,
             L"\nDrop Mesen2 .mss here\n",
             ID_BROWSE_B, ID_CONVERT_B, ID_OPEN_OUT_B, true);
@@ -477,6 +542,7 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_OPEN_OUT_B: open_folder(g_b.last_output_path); break;
         case ID_ROM_BROWSE_B: browse_for_rom(g_b); break;
         case ID_ROM_CLEAR_B:  clear_rom(g_b);      break;
+        case ID_UPGRADE_A:    run_upgrade(g_a);    break;
         }
         return 0;
     }
