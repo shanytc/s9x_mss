@@ -191,14 +191,26 @@ How we handle it:
 5. **apuram (`ARA` → `SND[0..65535]`).** The 64 KB SPC memory is byte-identical
    between legacy and modern and is copied wholesale into the synthetic SND.
 6. **SPC700 registers (`ARE` → `spc.pc/a/y/x/sp/ps`).** The 7-byte legacy ARE
-   section is parsed as `PC` (uint16 BE) + `A` + `Y` + `X` + `SP` + `PSW`
-   (the SAPURegisters union from snes9x 1.5.1). All six fields are written
-   straight to the .mss so mesen2 resumes the SPC mid-execution instead of
-   rebooting it via IPL ROM (which would clobber `apuram[$F4..$F7]` — the
-   ports the game polls at `$2140-$2143`).
-7. **SPC control byte (`APU[4]` → `spc.romEnabled`, `APU[7..10]` →
-   `spc.outputReg[0..3]`).** From the SAPU struct: `ShowROM` flag, OutPorts
-   array. `spc.timersEnabled` is set optimistically to 1.
+   section is the snes9x 1.5.1 `SAPURegisters` struct, big-endian:
+   `[0..1]=YA (Y high, A low)`, `[2]=X`, `[3]=S`, `[4]=P`, `[5..6]=PC (BE)`.
+   Verified by disassembling at the recovered PC — it lands on real SPC code
+   for the test states (`MOV A,$F6 / BNE …` music-driver poll loops). All six
+   fields are written straight to the .mss so mesen2 resumes the SPC
+   mid-execution instead of rebooting it via IPL ROM (which would clobber
+   `apuram[$F4..$F7]` — the ports the game polls at `$2140-$2143`).
+7. **SPC↔CPU ports — direction split** (critical and easy to get wrong because
+   Blargg APU and bAPU store them differently):
+   - **`spc.outputReg[0..3]` ← `APU[7..10]`** (`SAPU.OutPorts`). These are the
+     bytes the *SPC* last wrote — what the 65C816 reads at `$2140-$2143`.
+   - **`spc.cpuRegs[0..3]` ← `apuram[$F4..$F7]`** (= `SND[$F4..$F7]`). These
+     are the bytes the *CPU* last wrote — what the SPC reads from its $F4-$F7
+     MMIO. In Blargg APU `apuram[$F4..$F7]` IS the CPU's last write (SPC's read
+     view); in modern bAPU those same bytes are the SPC's output instead. The
+     default forward path writes `spc.outputReg` from `snd[$F4..$F7]` which is
+     correct for modern states but **wrong** for legacy — legacy override here.
+   - **`spc.newCpuRegs[0..3]`** mirrors `spc.cpuRegs`.
+   - **`spc.romEnabled`** from `APU[4]` (`SAPU.ShowROM`).
+   - **`spc.timersEnabled = 1`** optimistically.
 8. **DSP voice / echo state, timer counters, IAPU internals.** Not extracted
    — mesen2 keeps its default DSP/timer state and the music driver re-fills
    it from apuram on the next tick. Audio may glitch for a fraction of a

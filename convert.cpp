@@ -268,58 +268,70 @@ static void apply_forward_smp_blargg(const S9xState& s9x, MssFile& mss) {
 // IPL ROM on load (which would clobber the apuram output ports the game's
 // 65C816 side is polling at $2140-$2143).
 //
-// Best-guess ARE layout (7 bytes, derived from snes9x 1.5.1 SAPUExtra struct):
-//   [0..1]  PC  (big-endian)
-//   [2]     A
-//   [3]     Y
-//   [4]     X
-//   [5]     SP
-//   [6]     PSW
-// Field order matches the SAPURegisters union (YA = Y << 8 | A) and the
-// FreezeStruct big-endian INT_V serialisation snes9x 1.5.1 used.
+// ARE layout (7 bytes, snes9x 1.5.1 SAPURegisters serialised via FreezeStruct):
+//   [0..1]  YA  (big-endian: byte 0 = Y, byte 1 = A)
+//   [2]     X
+//   [3]     S   (stack pointer)
+//   [4]     P   (PSW status flags)
+//   [5..6]  PC  (big-endian)
+// Verified empirically: for the Yoshi's Safari state, ARE = 80 F3 FC 10 7B 19 64
+// gives PC=$1964 which lands on real SPC music-driver code (DEC Y / BNE / MOV A,$F6
+// — a port-poll loop). The opposite "PC first" reading lands on garbage.
 static void apply_forward_smp_legacy(const S9xState& s9x, MssFile& mss) {
     auto are_it = s9x.sections.find("ARE");
     if (are_it != s9x.sections.end() && are_it->second.size() >= 7) {
         const auto& are = are_it->second;
-        uint16_t pc = (uint16_t(are[0]) << 8) | are[1];
+        mss.add_u8 ("spc.y",  are[0]);
+        mss.add_u8 ("spc.a",  are[1]);
+        mss.add_u8 ("spc.x",  are[2]);
+        mss.add_u8 ("spc.sp", are[3]);
+        mss.add_u8 ("spc.ps", are[4]);
+        uint16_t pc = (uint16_t(are[5]) << 8) | are[6];
         mss.add_u16("spc.pc", pc);
-        mss.add_u8 ("spc.a",  are[2]);
-        mss.add_u8 ("spc.y",  are[3]);
-        mss.add_u8 ("spc.x",  are[4]);
-        mss.add_u8 ("spc.sp", are[5]);
-        mss.add_u8 ("spc.ps", are[6]);
     }
 
-    // SAPU section ($00F1 control byte) tells us whether IPL ROM was visible
-    // and which timers were running. Layout (from snes9x 1.5.1 SAPU):
+    // SAPU section (snes9x 1.5.1 SAPU struct, big-endian INT_V serialisation):
     //   [0..3]   Cycles (int32 BE)
-    //   [4]      ShowROM (bool8) — equivalent of $F1 bit 7
+    //   [4]      ShowROM (bool8) — $F1 bit 7, IPL ROM visibility
     //   [5]      Flags
     //   [6]      KeyedChannels
-    //   [7..10]  OutPorts[0..3] — what the SPC last wrote to apuram[$F4..$F7]
+    //   [7..10]  OutPorts[0..3] — SPC -> CPU ports. THIS is what the CPU reads
+    //            at $2140-$2143, NOT apuram[$F4..$F7]. In Blargg APU the two
+    //            directions use separate storage: apuram[$F4..$F7] holds the
+    //            CPU's last writes (SPC's read view), OutPorts holds the SPC's
+    //            last writes (CPU's read view). Modern bAPU collapsed those
+    //            into apuram[$F4..$F7] for the SPC-write side, which is why
+    //            the default forward-direction code (line ~408) writes
+    //            spc.outputReg from snd[$F4..$F7] — correct for modern, wrong
+    //            for legacy. Override here.
     auto apu_it = s9x.sections.find("APU");
     if (apu_it != s9x.sections.end() && apu_it->second.size() >= 11) {
         const auto& apu = apu_it->second;
         mss.add_u8("spc.romEnabled",     apu[4] ? 1 : 0);
         mss.add_u8("spc.timersEnabled",  1);   // best-effort
         mss.add_u8("spc.timersDisabled", 0);
-        // Make sure the CPU-visible port values match what the SPC last
-        // wrote. We already wrote spc.outputReg from apuram earlier; SAPU
-        // OutPorts is the same data, just being explicit here as a safety
-        // net in case the legacy state's apuram diverged from OutPorts.
         for (int i = 0; i < 4; ++i) {
             char k[40];
             std::snprintf(k, sizeof(k), "spc.outputReg[%d]", i);
-            mss.add_u8(k, apu[7 + i]);
+            mss.add_u8(k, apu[7 + i]);   // SPC -> CPU (CPU reads $2140-$2143)
         }
     }
 
-    // CPU -> SPC port direction. Legacy snes9x 1.5.1 didn't separately track
-    // these (they're written by the 65C816 side directly to apuram[$F4..$F7]
-    // via $2140 writes). Best we can do: assume the last CPU writes match the
-    // values currently in apuram, which were already in ARA. mesen2 also
-    // defaults these to zero if missing, which usually works because the SPC
-    // doesn't poll its IN ports unless the game explicitly synchronises.
+    // CPU -> SPC ports. In legacy Blargg APU these live in apuram[$F4..$F7]
+    // (the SPC's view; CPU writes via $2140-$2143 go straight here). mesen2's
+    // SPC reads its $F4-$F7 MMIO not from apuram but from spc.cpuRegs[], so
+    // we have to explicitly populate it. Pull from the synthesised SND (which
+    // we built from legacy ARA).
+    const Bytes& snd = s9x.section("SND");
+    if (snd.size() >= 0xF8) {
+        for (int i = 0; i < 4; ++i) {
+            char k[40];
+            std::snprintf(k, sizeof(k), "spc.cpuRegs[%d]", i);
+            mss.add_u8(k, snd[0xF4 + i]);
+            std::snprintf(k, sizeof(k), "spc.newCpuRegs[%d]", i);
+            mss.add_u8(k, snd[0xF4 + i]);
+        }
+    }
 }
 
 static void apply_forward_smp(const S9xState& s9x, MssFile& mss) {
