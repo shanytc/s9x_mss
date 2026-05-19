@@ -67,8 +67,11 @@ static void apply_forward_ppu(const S9xState& s9x, MssFile& mss) {
 
     mss.add_u8("ppu.forcedBlank",        (inidisp >> 7) & 1);
     mss.add_u8("ppu.screenBrightness",   inidisp & 0x0F);
-    mss.add_u8("ppu.bgMode",             p.BGMode & 7);
-    mss.add_u8("ppu.mode1Bg3Priority",   p.BG3Priority & 1);
+    // p.BGMode reads PPU byte 58 which is misaligned in legacy v6 PPU
+    // section (legacy CGDATA starts at byte 58 there). Always derive from
+    // FillRAM[$2105] instead — that's the BGMODE register snapshot.
+    mss.add_u8("ppu.bgMode",             bgmode & 7);
+    mss.add_u8("ppu.mode1Bg3Priority",   (bgmode >> 3) & 1);
     mss.add_u8("ppu.mainScreenLayers",   tm);
     mss.add_u8("ppu.subScreenLayers",    ts);
     mss.add_u8("ppu.cgramAddress",       p.CGADD);
@@ -100,21 +103,45 @@ static void apply_forward_ppu(const S9xState& s9x, MssFile& mss) {
                    |  uint32_t(p.FixedColourRed & 0x1F);
     mss.add_u16("ppu.fixedColor", fixed);
 
+    // For legacy states, s9x_decode_ppu's BG_SCBase/BG_NameBase parse from
+    // PPU offsets that assume modern v12 layout. Legacy v6 has smaller
+    // VMA/BG field types so those offsets read garbage. Override by
+    // deriving from FillRAM registers ($2107-$210A for SCBase, $210B/210C
+    // for NameBase, $210D-$2114 latches are zero for legacy mid-init —
+    // game's first NMI will fix them anyway).
+    const bool legacy = (s9x.original_version >= 1000 && s9x.original_version < 2000);
     for (int n = 0; n < 4; ++n) {
         char k[64];
+        uint16_t scbase, namebase, hoffset, voffset;
+        uint8_t scsize_bits;
+        if (legacy) {
+            uint8_t bgnsc = s9x.fil(0x2107 + n);
+            scbase      = uint16_t((bgnsc & 0xFC) << 8);
+            scsize_bits = uint8_t(bgnsc & 0x03);
+            uint8_t nba = s9x.fil((n < 2) ? 0x210B : 0x210C);
+            uint8_t nb_nib = (n & 1) ? (nba >> 4) : (nba & 0x0F);
+            namebase    = uint16_t(nb_nib) << 12;
+            hoffset     = 0;  // latch — game's NMI will refresh
+            voffset     = 0;
+        } else {
+            scbase      = p.BG_SCBase[n];
+            namebase    = p.BG_NameBase[n];
+            hoffset     = p.BG_HOffset[n];
+            voffset     = p.BG_VOffset[n];
+            scsize_bits = uint8_t(p.BG_SCSize[n]);
+        }
         std::snprintf(k, sizeof(k), "ppu.layers[%d].tilemapAddress", n);
-        mss.add_u16(k, p.BG_SCBase[n]);
+        mss.add_u16(k, scbase);
         std::snprintf(k, sizeof(k), "ppu.layers[%d].chrAddress", n);
-        mss.add_u16(k, p.BG_NameBase[n]);
+        mss.add_u16(k, namebase);
         std::snprintf(k, sizeof(k), "ppu.layers[%d].hscroll", n);
-        mss.add_u16(k, p.BG_HOffset[n]);
+        mss.add_u16(k, hoffset);
         std::snprintf(k, sizeof(k), "ppu.layers[%d].vscroll", n);
-        mss.add_u16(k, p.BG_VOffset[n]);
-        int sc = p.BG_SCSize[n];
+        mss.add_u16(k, voffset);
         std::snprintf(k, sizeof(k), "ppu.layers[%d].doubleWidth", n);
-        mss.add_u8(k, sc & 1);
+        mss.add_u8(k, scsize_bits & 1);
         std::snprintf(k, sizeof(k), "ppu.layers[%d].doubleHeight", n);
-        mss.add_u8(k, (sc >> 1) & 1);
+        mss.add_u8(k, (scsize_bits >> 1) & 1);
         std::snprintf(k, sizeof(k), "ppu.layers[%d].largeTiles", n);
         mss.add_u8(k, (bgmode >> (4 + n)) & 1);
     }

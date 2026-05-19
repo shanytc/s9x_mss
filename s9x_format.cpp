@@ -509,8 +509,20 @@ S9xRegisters s9x_decode_registers(const S9xState& s) {
     return x;
 }
 
-Bytes s9x_ppu_cgdata_be(const S9xState& s) { return s.ppu_slice(PPU_CGDATA_OFF, 512); }
-Bytes s9x_ppu_oam      (const S9xState& s) { return s.ppu_slice(PPU_OAMDATA_OFF, 544); }
+Bytes s9x_ppu_cgdata_be(const S9xState& s) {
+    // Legacy snes9x 1.5.x PPU section uses smaller VMA/WRAM/BG field
+    // types so CGDATA[256] starts at byte 58 in raw legacy, or byte 59
+    // after upgrade_section_to_v12 inserts CGSavedByte at byte 63.
+    // Modern v12 has CGDATA at byte 64. Adjust the slice offset so the
+    // mss path's ppu.cgram entry reads from the actual CGDATA bytes
+    // rather than from misaligned VMA/BG bytes.
+    const int off = (s.original_version >= 1000 && s.original_version < 2000)
+                    ? 59
+                    : PPU_CGDATA_OFF;
+    return s.ppu_slice(off, 512);
+}
+
+Bytes s9x_ppu_oam(const S9xState& s) { return s.ppu_slice(PPU_OAMDATA_OFF, 544); }
 
 // Forward declaration; defined just below probe_s9x.
 Bytes maybe_gunzip_first14(const Bytes& in);
