@@ -54,11 +54,31 @@ Side A also has an **Upgrade legacy → v12** button that only enables when the
 dropped file uses the pre-v6 `#!snes9x:NNNN` header (snes9x 1.5.0 / 1.5.1
 era). Current snes9x builds can't load those states directly; clicking the
 button writes a `_upgraded` copy in the modern `#!s9xsnp:0012` format that
-modern snes9x will load. Best-effort: 65C816 / PPU / VRAM / WRAM / SRAM /
-FillRAM are exact; SPC700 registers + DSP regs + timers are extracted from
-the legacy `APU` / `ARE` / `IAP` sections; mid-instruction state and DSP
-voice internals are zeroed. Has nothing to do with mesen2 — pure snes9x
-format migration.
+modern snes9x will load. Has nothing to do with mesen2 — pure snes9x format
+migration.
+
+What's preserved exactly: VRAM, WRAM, SRAM, OAM RAM, CGRAM, 65C816 registers,
+SPC700 RAM. What's reconstructed (because legacy v6 structs had different
+field sizes than modern v12): PPU pre-CGDATA fields (VMA / WRAM / BG[N]
+config / BGMode / CGADD) — all derived from the FillRAM register snapshot.
+PPU OBJ control fields (`OBJNameBase` / `OBJNameSelect` / `OBJSizeSelect`)
+derived from `FillRAM[$2101]` using snes9x's `(val & 3) << 14` formula.
+
+What's sacrificed: audio. The SPC's normal handshake with the CPU is
+cycle-precise and not preserved across the legacy → modern format change,
+so the converter plants a 26-byte SPC echo loop at apuram `$1947` and forces
+`SMP.PC = $1947`. The loop mirrors `cpu.registers[N]` back to
+`apuram[$F4+N]` so any CPU `CMP $2140 / BNE` audio-handshake spinloop
+satisfies and the game runs. Real audio replay is dead until the game
+re-uploads its SPC audio engine (most games don't).
+
+Best with **gameplay states**, not mid-init / title-screen states. A
+mid-init save captures the game before it has finished uploading some
+VRAM data (BG tile graphics for the upcoming scene); after upgrade the
+game runs cleanly but BG layers can render blank because that VRAM data
+was never in the saved file. See `docs/legacy_upgrade.md` for the full
+fix chain, the empirical findings, and the diagnostic CPU-debugger
+dialog (separate `debugger` branch in the snes9x-latest repo).
 
 ## Files
 
@@ -93,3 +113,17 @@ Both directions inherit the limitations called out at the top of
   envelopes), the event scheduler queue, and mid-cycle state machines start
   at their boot defaults rather than mid-game state. Most games recover by
   the next frame; some might briefly stutter or visually glitch.
+
+For the **legacy → v12 upgrade path** specifically (separate from the
+mesen2 conversions):
+
+- Audio replay is sacrificed by design (echo-loop replaces the SPC's audio
+  engine) to escape cycle-precise CPU↔SPC handshake spinloops that don't
+  survive the format change.
+- Mid-init / title-screen legacy states can produce playable but
+  rendering-incomplete upgrades — sprites render correctly but BG layers
+  can be blank if the legacy save happened before the game finished
+  uploading scene BG tile graphics to VRAM. State-side editing can't
+  manufacture VRAM data the legacy state didn't capture. See
+  `docs/legacy_upgrade.md` for the empirical findings.
+- Save during gameplay (post-init) for clean upgrades.
