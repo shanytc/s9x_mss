@@ -1923,11 +1923,22 @@ void upgrade_legacy_s9x_state(const std::string& in_path,
             auto u16be = [&ppu](size_t off, uint16_t v) {
                 ppu[off] = uint8_t(v >> 8); ppu[off+1] = uint8_t(v & 0xFF);
             };
-            // Save existing CGDATA bytes (currently at wrong offset 59
-            // due to the 5-byte shift) so we can reposition them.
-            // After insertion of 5 bytes, CGDATA should land at byte 64.
-            Bytes cgdata(ppu.begin() + 59, ppu.begin() + 59 + 512);
-            Bytes tail(ppu.begin() + 59 + 512, ppu.end());
+            // Save CGDATA bytes. Legacy v6 PPU has CGDATA[0..511] starting
+            // at legacy byte 58. upgrade_section_to_v12 maps legacy[0..62]
+            // to modern[0..62] and inserts CGSavedByte at modern[63], then
+            // maps legacy[63..2648] to modern[64..2649]. So in the post-
+            // promotion modern PPU we're working with here:
+            //   modern[58..62]   = legacy[58..62]  = CGDATA[0..4]    (5 bytes)
+            //   modern[63]       = 0               = CGSavedByte     (not CGDATA)
+            //   modern[64..570]  = legacy[63..569] = CGDATA[5..511]  (507 bytes)
+            // We need to stitch those two chunks back into 512 contiguous
+            // CGDATA bytes (without the CGSavedByte gap) so we can place
+            // them at the correct modern v12 offset 64.
+            Bytes cgdata;
+            cgdata.reserve(512);
+            cgdata.insert(cgdata.end(), ppu.begin() + 58, ppu.begin() + 63);   // CGDATA[0..4]
+            cgdata.insert(cgdata.end(), ppu.begin() + 64, ppu.begin() + 64 + 507); // CGDATA[5..511]
+            Bytes tail(ppu.begin() + 64 + 507, ppu.end());
 
             // Zero pre-CGDATA region fully.
             std::memset(&ppu[0], 0, 64);
@@ -1993,6 +2004,46 @@ void upgrade_legacy_s9x_state(const std::string& in_path,
             size_t tail_len = std::min(tail.size(), ppu.size() - tail_dst);
             if (tail_len > 0)
                 std::memcpy(&ppu[tail_dst], tail.data(), tail_len);
+        }
+    }
+
+    // 7b''''. Overwrite the OBJ control fields (PPU bytes 1984..1991) from
+    //         FillRAM[$2101] = OBSEL. Legacy v6's smaller per-OBJ struct
+    //         pushes OBJControl 384 bytes earlier in the section vs modern
+    //         v12, so the bytes at modern offsets 1984+ in our shifted
+    //         upgrade output land somewhere inside legacy's OAMData region
+    //         (= garbage as OBJNameBase / OBJNameSelect / OBJSizeSelect).
+    //         Result: snes9x reads OBJNameBase=$0000 and sprite tile data
+    //         comes from the wrong VRAM area → Yoshi sprite glitches.
+    //
+    //         OBSEL bit layout:
+    //           bits 0-2: OBJ name base address (in 8KB chunks)
+    //           bits 3-4: OBJ name select (gap between two sprite tile sets)
+    //           bits 5-7: OBJ size index (8x8/16x16, 8x8/32x32, etc.)
+    //
+    //         Modern v12 PPU offsets 1984..1991:
+    //           [1984] OBJThroughMain     (bool8 — defaults to OK)
+    //           [1985] OBJThroughSub      (bool8)
+    //           [1986] OBJAddition        (bool8)
+    //           [1987-1988] OBJNameBase   (uint16 BE — = (OBSEL & 7) << 13)
+    //           [1989-1990] OBJNameSelect (uint16 BE — = (((OBSEL>>3)&3)+1)<<12)
+    //           [1991] OBJSizeSelect      (uint8 — = (OBSEL >> 5) & 7)
+    if (s9x.sections.count("PPU") && s9x.sections.count("FIL")) {
+        Bytes& ppu = s9x.section("PPU");
+        const Bytes& fil = s9x.section("FIL");
+        if (ppu.size() >= 1992 && fil.size() > 0x2101) {
+            uint8_t obsel = fil[0x2101];
+            uint16_t name_base = uint16_t(obsel & 0x07) << 13;
+            uint16_t name_sel  = uint16_t(((obsel >> 3) & 0x03) + 1) << 12;
+            uint8_t  size_sel  = (obsel >> 5) & 0x07;
+            ppu[1984] = 0;            // OBJThroughMain
+            ppu[1985] = 0;            // OBJThroughSub
+            ppu[1986] = 0;            // OBJAddition
+            ppu[1987] = uint8_t(name_base >> 8);
+            ppu[1988] = uint8_t(name_base & 0xFF);
+            ppu[1989] = uint8_t(name_sel >> 8);
+            ppu[1990] = uint8_t(name_sel & 0xFF);
+            ppu[1991] = size_sel;
         }
     }
 

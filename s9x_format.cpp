@@ -511,15 +511,26 @@ S9xRegisters s9x_decode_registers(const S9xState& s) {
 
 Bytes s9x_ppu_cgdata_be(const S9xState& s) {
     // Legacy snes9x 1.5.x PPU section uses smaller VMA/WRAM/BG field
-    // types so CGDATA[256] starts at byte 58 in raw legacy, or byte 59
-    // after upgrade_section_to_v12 inserts CGSavedByte at byte 63.
-    // Modern v12 has CGDATA at byte 64. Adjust the slice offset so the
-    // mss path's ppu.cgram entry reads from the actual CGDATA bytes
-    // rather than from misaligned VMA/BG bytes.
-    const int off = (s.original_version >= 1000 && s.original_version < 2000)
-                    ? 59
-                    : PPU_CGDATA_OFF;
-    return s.ppu_slice(off, 512);
+    // types so CGDATA[256] starts at byte 58 in raw legacy. After
+    // upgrade_section_to_v12 inserts CGSavedByte at byte 63, post-
+    // promotion modern PPU has:
+    //   bytes 58..62  = legacy CGDATA[0..4]
+    //   byte  63      = CGSavedByte (= 0)
+    //   bytes 64..570 = legacy CGDATA[5..511]
+    // So a single ppu_slice(58, 512) would include CGSavedByte at
+    // output offset 5, corrupting CGDATA[5] high byte (and shifting
+    // the rest by one). Stitch the two valid CGDATA chunks together,
+    // skipping the CGSavedByte gap, to produce clean 512 CGDATA bytes.
+    if (s.original_version >= 1000 && s.original_version < 2000) {
+        Bytes head = s.ppu_slice(58, 5);     // CGDATA[0..4]
+        Bytes tail = s.ppu_slice(64, 507);   // CGDATA[5..511]
+        Bytes out;
+        out.reserve(512);
+        out.insert(out.end(), head.begin(), head.end());
+        out.insert(out.end(), tail.begin(), tail.end());
+        return out;
+    }
+    return s.ppu_slice(PPU_CGDATA_OFF, 512);
 }
 
 Bytes s9x_ppu_oam(const S9xState& s) { return s.ppu_slice(PPU_OAMDATA_OFF, 544); }
