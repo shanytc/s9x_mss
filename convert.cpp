@@ -1969,6 +1969,33 @@ void upgrade_legacy_s9x_state(const std::string& in_path,
         }
     }
 
+    // 7b'''. Zero the OBJ[128] sprite array (PPU bytes 576..1983) and
+    //        the OAMData region. Legacy v6 PPU's OBJ struct had smaller
+    //        field types (e.g. uint8 HPos instead of int16) so legacy
+    //        OBJ bytes don't map to modern v12's 11-byte-per-OBJ layout.
+    //        Result: VFlip/HFlip/Priority/Palette read as garbage values
+    //        (e.g. $95 for VFlip which should only ever be 0 or 1),
+    //        sprites render with corrupt tile/palette indices.
+    //
+    //        Fix is benign: zero the whole sprite-table region. Most
+    //        games' NMI handler DMA-copies OAM from WRAM ($0200-$03FF
+    //        typically) into PPU OAM each vblank via $4300+/$420B,
+    //        which immediately repopulates PPU.OBJ[] correctly. So
+    //        sprites are blank for at most 1 frame post-resume.
+    //
+    //        Modern v12 PPU layout post-CGDATA:
+    //          [64..575]      CGDATA (512 bytes)
+    //          [576..1983]    OBJ[128] (1408 bytes, 11 bytes each)
+    //          [1984..2527]   OAMData (544 bytes) + intermediate fields
+    //          [2528..2641]   timer / mode 7 / window / clip fields
+    //          [2641..2642]   ScreenHeight (set by step 7b' below)
+    if (s9x.sections.count("PPU")) {
+        Bytes& ppu = s9x.section("PPU");
+        if (ppu.size() >= 1984) {
+            std::memset(&ppu[576], 0, 1408);  // OBJ[128]
+        }
+    }
+
     // 7b'. Override PPU.ScreenHeight in the upgraded PPU section. Legacy
     //      snes9x 1.5.x had a different PPU struct layout, and the byte
     //      that ends up at v12 offset 2641 (= ScreenHeight, uint16 BE)
