@@ -2016,25 +2016,31 @@ void upgrade_legacy_s9x_state(const std::string& in_path,
     //         Result: snes9x reads OBJNameBase=$0000 and sprite tile data
     //         comes from the wrong VRAM area → Yoshi sprite glitches.
     //
-    //         OBSEL bit layout:
-    //           bits 0-2: OBJ name base address (in 8KB chunks)
-    //           bits 3-4: OBJ name select (gap between two sprite tile sets)
-    //           bits 5-7: OBJ size index (8x8/16x16, 8x8/32x32, etc.)
+    //         OBSEL bit layout (per snes9x ppu.cpp $2101 handler):
+    //           PPU.OBJNameBase   = (val & 3) << 14   (= (val & 3) * $4000)
+    //           PPU.OBJNameSelect = ((val >> 3) & 3) << 13  (= * $2000)
+    //           PPU.OBJSizeSelect = (val >> 5) & 7
+    //
+    //         (Note: snes9x uses & 3 << 14, NOT & 7 << 13 like Mesen2's
+    //         python ref tool does for ppu.oamBaseAddress. Different
+    //         internal representation of the same hardware register.
+    //         Verified: working state has FIL[$2101]=$03 and
+    //         PPU.OBJNameBase=$C000 = (3 & 3) << 14.)
     //
     //         Modern v12 PPU offsets 1984..1991:
     //           [1984] OBJThroughMain     (bool8 — defaults to OK)
     //           [1985] OBJThroughSub      (bool8)
     //           [1986] OBJAddition        (bool8)
-    //           [1987-1988] OBJNameBase   (uint16 BE — = (OBSEL & 7) << 13)
-    //           [1989-1990] OBJNameSelect (uint16 BE — = (((OBSEL>>3)&3)+1)<<12)
-    //           [1991] OBJSizeSelect      (uint8 — = (OBSEL >> 5) & 7)
+    //           [1987-1988] OBJNameBase   (uint16 BE)
+    //           [1989-1990] OBJNameSelect (uint16 BE)
+    //           [1991] OBJSizeSelect      (uint8)
     if (s9x.sections.count("PPU") && s9x.sections.count("FIL")) {
         Bytes& ppu = s9x.section("PPU");
         const Bytes& fil = s9x.section("FIL");
         if (ppu.size() >= 1992 && fil.size() > 0x2101) {
             uint8_t obsel = fil[0x2101];
-            uint16_t name_base = uint16_t(obsel & 0x07) << 13;
-            uint16_t name_sel  = uint16_t(((obsel >> 3) & 0x03) + 1) << 12;
+            uint16_t name_base = uint16_t(obsel & 0x03) << 14;
+            uint16_t name_sel  = uint16_t((obsel >> 3) & 0x03) << 13;
             uint8_t  size_sel  = (obsel >> 5) & 0x07;
             ppu[1984] = 0;            // OBJThroughMain
             ppu[1985] = 0;            // OBJThroughSub
