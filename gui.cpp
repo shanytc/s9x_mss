@@ -5,7 +5,8 @@
 // Workflow per side: drop a file (or click Browse). The app validates the
 // header by magic bytes (not by extension), displays format + version, then
 // enables the Convert button. Clicking Convert writes the output next to the
-// input with a "_from_snes9x" / "_from_mesen2" suffix.
+// input with a "_from_snes9x" / "_from_mesen2" suffix — toggleable via the
+// "Include suffix" checkbox at the bottom of the window.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -35,6 +36,7 @@ enum {
     ID_ROM_BROWSE_B = 1008,
     ID_ROM_CLEAR_B  = 1009,
     ID_UPGRADE_A    = 1010,
+    ID_SUFFIX_CB    = 1011,
 };
 
 // ---- per-pane state ----
@@ -68,6 +70,7 @@ static Pane g_b;                // .mss -> .009
 static HWND g_main = nullptr;
 static HWND g_title_a = nullptr;
 static HWND g_title_b = nullptr;
+static HWND g_suffix_cb = nullptr;
 static HFONT g_font_big  = nullptr;
 static HFONT g_font_norm = nullptr;
 static HBRUSH g_drop_brush = nullptr;
@@ -143,13 +146,19 @@ static void run_conversion(Pane& p, bool forward) {
     fs::path q(in_utf8);
     std::string stem = q.stem().string();
     std::string out_utf8;
+    bool include_suffix = g_suffix_cb
+        && SendMessageW(g_suffix_cb, BM_GETCHECK, 0, 0) == BST_CHECKED;
     if (forward) {
-        std::string tag = "_from_snes9x";
-        if (stem.find(tag) == std::string::npos) stem += tag;
+        if (include_suffix) {
+            std::string tag = "_from_snes9x";
+            if (stem.find(tag) == std::string::npos) stem += tag;
+        }
         out_utf8 = (q.parent_path() / (stem + ".mss")).string();
     } else {
-        std::string tag = "_from_mesen2";
-        if (stem.find(tag) == std::string::npos) stem += tag;
+        if (include_suffix) {
+            std::string tag = "_from_mesen2";
+            if (stem.find(tag) == std::string::npos) stem += tag;
+        }
         // SNES9x states traditionally use .000-.999 numbered slots; keep the
         // user's original extension so naming feels consistent.
         std::string ext = q.extension().string();
@@ -515,6 +524,16 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         create_pane(h, g_b,
             L"\nDrop Mesen2 .mss here\n",
             ID_BROWSE_B, ID_CONVERT_B, ID_OPEN_OUT_B, true);
+
+        // Footer: global toggle for the "_from_snes9x" / "_from_mesen2" tag
+        // applied to output filenames. Checked by default (legacy behavior);
+        // unchecked when the user wants the output to keep the input's name.
+        g_suffix_cb = CreateWindowExW(0, L"BUTTON",
+            L"Include \"_from_snes9x\" / \"_from_mesen2\" suffix in output filename",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
+            0, 0, 100, 22, h, HMENU(intptr_t(ID_SUFFIX_CB)), hi, nullptr);
+        SendMessageW(g_suffix_cb, WM_SETFONT, WPARAM(g_font_norm), TRUE);
+        SendMessageW(g_suffix_cb, BM_SETCHECK, BST_CHECKED, 0);
         return 0;
     }
 
@@ -524,10 +543,19 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int title_h = 28;
         int pane_w = (rc.right - 3 * margin) / 2;
         int pane_top = margin;
-        int total_h = rc.bottom - margin - margin;
+        const int FOOTER_H = 22;
+        // Reserve space for the suffix-toggle checkbox at the bottom so the
+        // panes (and their drop areas) lay out into the remaining height.
+        int total_h = rc.bottom - margin - margin - (FOOTER_H + GAP);
         int drop_h = compute_shared_drop_h(total_h, title_h);
         layout_pane(g_a, g_title_a, margin,                  pane_top, pane_w, total_h, title_h, drop_h);
         layout_pane(g_b, g_title_b, 2 * margin + pane_w,     pane_top, pane_w, total_h, title_h, drop_h);
+        if (g_suffix_cb) {
+            SetWindowPos(g_suffix_cb, nullptr,
+                margin, rc.bottom - margin - FOOTER_H,
+                rc.right - 2 * margin, FOOTER_H,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         return 0;
     }
 
@@ -589,7 +617,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int show) {
     // useful happens when stretching the window. Sizes are computed for the
     // exact client area the layout needs.
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT wantR = { 0, 0, 900, 360 };
+    RECT wantR = { 0, 0, 900, 390 };
     AdjustWindowRectEx(&wantR, style, FALSE, WS_EX_ACCEPTFILES);
     g_main = CreateWindowExW(
         WS_EX_ACCEPTFILES, cls,
