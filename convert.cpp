@@ -1836,6 +1836,186 @@ void upgrade_legacy_s9x_state(const std::string& in_path,
     snd[0xF6] = 0;
     snd[0xF7] = 0;
 
+    // 7a. Force NMI enable in the FillRAM I/O register shadow. Legacy
+    //     mid-audio-init states often have $4200 = $00 (NMI disabled
+    //     while uploading SPC code so the upload protocol isn't disturbed
+    //     by vblank). In legacy snes9x the game's resume path eventually
+    //     re-enables NMI via STA $4200, but modern snes9x is stricter and
+    //     gets parked in main-loop subroutines that depend on a vblank
+    //     NMI driver to advance. Setting bit 7 (NMI enable) lets the
+    //     game's NMI vector fire on the next vblank — which restarts the
+    //     frame loop at $80:CBA0 (INC frame counter -> JSL chain -> BIT
+    //     $4212 vblank wait -> RTI/RTL).
+    //
+    //     We OR with $80 instead of overwriting so we preserve the
+    //     legacy V/H-IRQ enable bits (5-4) and joypad-read bit (0) the
+    //     legacy state did capture.
+    if (s9x.sections.count("FIL")) {
+        Bytes& fil = s9x.section("FIL");
+        if (fil.size() > 0x4200) {
+            fil[0x4200] |= 0x80;
+        }
+    }
+
+    // 7b. Zero APU side timing accumulators so modern snes9x doesn't
+    //     think it needs to catch the APU up to a stale CPU cycle count
+    //     on load. SND tail layout per apu.cpp::S9xAPUSaveState:
+    //       [66342..66345]  spc::reference_time
+    //       [66346..66349]  spc::remainder
+    //       [66350..66353]  dsp.clock
+    //
+    //     CPU side Cycles / PrevCycles / V_Counter are INTENTIONALLY LEFT
+    //     ALONE — verified against a working .mss-converted .000 state
+    //     which has CPU.Cycles=$330 / V_Counter=$B4 and runs fine in modern
+    //     snes9x. Zeroing those caused the resume to land at scanline 0
+    //     instead of the legacy save's actual scanline (12 for Yoshi's
+    //     Safari), which seems to confuse modern snes9x's frame state.
+    if (snd.size() >= 66354) {
+        std::memset(&snd[66342], 0, 12);
+    }
+
+    // 7b''. Rebuild PPU pre-CGDATA fields (bytes 0..63) from FIL register
+    //       state. Legacy snes9x 1.5.x had a different PPU struct layout
+    //       in this region (smaller VMA/WRAM/BG field types), so legacy
+    //       PPU bytes 0..57 don't map to modern v12 PPU bytes 0..63
+    //       correctly. The 6-byte mismatch shifts CGDATA from its
+    //       expected v12 offset 64 down to 59, and modern snes9x then
+    //       reads VMA / BG / BGMode / CGADD from wrong positions —
+    //       result: corrupt BG tile data pointers and a yellow/pink
+    //       palette-fallback render (see Yoshi's Safari boss screen).
+    //
+    //       Reconstruct the 64 pre-CGDATA bytes from FIL register
+    //       state (which we have correctly preserved). HOffset / VOffset
+    //       latches aren't in FIL — we default them to 0; first frame
+    //       after resume may show a 1-frame BG-scroll glitch which the
+    //       game's NMI handler corrects immediately on next vblank.
+    if (s9x.sections.count("PPU") && s9x.sections.count("FIL")) {
+        Bytes& ppu = s9x.section("PPU");
+        const Bytes& fil = s9x.section("FIL");
+        if (ppu.size() >= 64 + 512 && fil.size() >= 0x2140) {
+            auto u16be = [&ppu](size_t off, uint16_t v) {
+                ppu[off] = uint8_t(v >> 8); ppu[off+1] = uint8_t(v & 0xFF);
+            };
+            // Save existing CGDATA bytes (currently at wrong offset 59
+            // due to the 5-byte shift) so we can reposition them.
+            // After insertion of 5 bytes, CGDATA should land at byte 64.
+            Bytes cgdata(ppu.begin() + 59, ppu.begin() + 59 + 512);
+            Bytes tail(ppu.begin() + 59 + 512, ppu.end());
+
+            // Zero pre-CGDATA region fully.
+            std::memset(&ppu[0], 0, 64);
+
+            // VMA struct (10 bytes total).
+            uint8_t vmain = fil[0x2115];
+            ppu[0] = (vmain & 0x80) ? 1 : 0;                  // VMA.High (bool8)
+            // Increment value per VMAIN bits 0-1: 00=1, 01=32, 10/11=128
+            static const uint8_t vma_inc_table[4] = { 1, 32, 128, 128 };
+            ppu[1] = vma_inc_table[vmain & 0x03];             // VMA.Increment
+            u16be(2, fil[0x2116] | (uint16_t(fil[0x2117]) << 8)); // VMA.Address
+            // Mask1, FullGraphicCount, Shift — derived from VMAIN remap bits
+            // 2-3 for full-graphics rotation. We don't have these exactly;
+            // 0 is safe for non-rotation modes.
+            u16be(4, 0xFFFF);                                  // VMA.Mask1
+            u16be(6, 0);                                       // VMA.FullGraphicCount
+            u16be(8, 0);                                       // VMA.Shift
+
+            // WRAM (uint32 BE at offset 10..13) — derived from $2181-$2183
+            uint32_t wram_addr = uint32_t(fil[0x2181]) |
+                                 (uint32_t(fil[0x2182]) << 8) |
+                                 (uint32_t(fil[0x2183] & 1) << 16);
+            ppu[10] = uint8_t(wram_addr >> 24);
+            ppu[11] = uint8_t(wram_addr >> 16);
+            ppu[12] = uint8_t(wram_addr >> 8);
+            ppu[13] = uint8_t(wram_addr & 0xFF);
+
+            // BG[0..3]: 11 bytes each at offsets 14, 25, 36, 47.
+            for (int n = 0; n < 4; ++n) {
+                size_t bg = 14 + n * 11;
+                uint8_t bgnsc = fil[0x2107 + n];                  // $2107..$210A
+                uint16_t scbase = (uint16_t)((bgnsc & 0xFC) << 8);
+                u16be(bg + 0, scbase);                            // SCBase
+                u16be(bg + 2, 0);                                  // HOffset (latch — default 0)
+                u16be(bg + 4, 0);                                  // VOffset (latch — default 0)
+                ppu[bg + 6] = (fil[0x2105] >> (4 + n)) & 1;       // BGSize
+                // NameBase: BG12NBA / BG34NBA each pack 2 BGs in nibbles
+                uint8_t nba = (n < 2) ? fil[0x210B] : fil[0x210C];
+                uint8_t nb_nib = (n & 1) ? (nba >> 4) : (nba & 0x0F);
+                u16be(bg + 7, uint16_t(nb_nib) << 12);            // NameBase
+                u16be(bg + 9, bgnsc & 0x03);                       // SCSize
+            }
+
+            // BGMode, BG3Priority, CGFLIP, CGFLIPRead, CGADD at offsets 58-62.
+            uint8_t bgmode = fil[0x2105];
+            ppu[58] = bgmode & 0x07;                              // BGMode
+            ppu[59] = (bgmode >> 3) & 1;                          // BG3Priority
+            ppu[60] = 0;                                          // CGFLIP
+            ppu[61] = 0;                                          // CGFLIPRead
+            ppu[62] = fil[0x2121];                                // CGADD
+            ppu[63] = 0;                                          // CGSavedByte
+
+            // Restore CGDATA + the rest of the section at correct offsets.
+            // ppu is currently 2652 bytes; CGDATA goes to 64..575; tail
+            // continues from byte 576. Since legacy gave us 5 bytes too few
+            // before CGDATA, the original tail starts 5 bytes earlier. We
+            // need to slide it.
+            std::memcpy(&ppu[64], cgdata.data(), 512);
+            // The original tail (everything after CGDATA in legacy=2649-byte
+            // PPU) has its own structure that lined up with modern v12 once
+            // CGDATA is moved. Copy back.
+            size_t tail_dst = 64 + 512;
+            size_t tail_len = std::min(tail.size(), ppu.size() - tail_dst);
+            if (tail_len > 0)
+                std::memcpy(&ppu[tail_dst], tail.data(), tail_len);
+        }
+    }
+
+    // 7b'. Override PPU.ScreenHeight in the upgraded PPU section. Legacy
+    //      snes9x 1.5.x had a different PPU struct layout, and the byte
+    //      that ends up at v12 offset 2641 (= ScreenHeight, uint16 BE)
+    //      after the v6→v12 promoter's byte-shift is some unrelated
+    //      legacy field. Modern snes9x reads it as ScreenHeight and gets
+    //      values like $6403 (= 25603) which makes the vblank-entry check
+    //      `V_Counter == ScreenHeight + 1` never match — vblank handler
+    //      never runs, SCAN_KEYS_FLAG never set, S9xMainLoop never returns,
+    //      Windows marks snes9x as Not Responding.
+    //
+    //      Hardcode the correct value: 224 for NTSC standard, 239 if the
+    //      game enabled overscan via $2133 bit 2 (= FIL[$2133] & 0x04).
+    if (s9x.sections.count("PPU")) {
+        Bytes& ppu = s9x.section("PPU");
+        if (ppu.size() >= 2643) {
+            uint8_t setini = 0;
+            if (s9x.sections.count("FIL")) {
+                const Bytes& fil = s9x.section("FIL");
+                if (fil.size() > 0x2133) setini = fil[0x2133];
+            }
+            uint16_t sh = (setini & 0x04) ? 239 : 224;
+            ppu[2641] = uint8_t(sh >> 8);   // BE: high byte first
+            ppu[2642] = uint8_t(sh & 0xFF);
+        }
+    }
+
+    // 7c. Clear CPU.Flags. Legacy snes9x 1.5.x reused some bits in this
+    //     field for purposes that modern snes9x interprets very
+    //     differently — most damagingly bit 2 (0x04). Modern snes9x
+    //     treats this bit as SINGLE_STEP_FLAG (see snes9x.h), which puts
+    //     the emulator into "step one instruction per frame call"
+    //     debugger mode. Verified on Yoshi's Safari: legacy Flags=$14
+    //     (= SCAN_KEYS_FLAG | SINGLE_STEP_FLAG in modern terms) made the
+    //     game appear permanently frozen even though CPU was advancing
+    //     ~1 instruction every 16ms.
+    //
+    //     CPU.Flags lives at offset 12 of the CPU section (4-byte BE
+    //     INT_V) in both v6 and v12 layouts. None of these flag bits are
+    //     game-state — they're emulator-internal (debugger, frame
+    //     advance, key-scan flags). Clearing them is always safe.
+    if (s9x.sections.count("CPU")) {
+        Bytes& cpu = s9x.section("CPU");
+        if (cpu.size() >= 16) {
+            cpu[12] = cpu[13] = cpu[14] = cpu[15] = 0;
+        }
+    }
+
     // 8. Drop the legacy-only sections so save() emits a clean modern state.
     for (const char* tag : { "APU", "ARE", "IAP", "SOU" })
         s9x.sections.erase(tag);

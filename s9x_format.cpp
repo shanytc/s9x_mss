@@ -82,8 +82,10 @@ static Bytes upgrade_legacy_section(const std::string& tag, Bytes raw) {
         std::memcpy(&v6tim[0], &raw[0], 32);
         // bytes 32-35: NMITriggerPos = 0xFFFF (no NMI pending).
         v6tim[34] = 0xFF; v6tim[35] = 0xFF;
-        // bytes 36-39: WRAMRefreshPos = 538.
-        v6tim[37] = 0x02; v6tim[38] = 0x1A;
+        // bytes 36-39: WRAMRefreshPos = 538 = 0x0000021A (big-endian).
+        // Byte indices into the 4-byte BE field: 36=MSB, 37, 38, 39=LSB.
+        // So 0x02 goes at byte 38, 0x1A at byte 39 — NOT 37/38.
+        v6tim[38] = 0x02; v6tim[39] = 0x1A;
         // bytes 40-43: RenderPos = 512 (modern SNES_RENDER_START_HC).
         v6tim[42] = 0x02;
         // byte 44: InterlaceField = 0.

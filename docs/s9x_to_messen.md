@@ -74,14 +74,18 @@ blob. The blob is a flat sequence of `<NUL-terminated key>` + `<uint32 LE size>`
 | `FillRAM[$2133]` SETINI        | `ppu.hiResMode`, `ppu.screenInterlace`, `ppu.objInterlace`, `ppu.overscanMode`      |   ✓    |
 | `PPU.FixedColour{Red,Green,Blue}` | `ppu.fixedColor` (packed 15-bit BGR)                                             |   ✓    |
 | `PPU.Matrix{A,B,C,D}`, `Centre{X,Y}`, `M7{HOFS,VOFS}` | `ppu.mode7.matrix[0..3]`, `centerX/Y`, `hscroll/vscroll` | ✓ |
-| `PPU.HTimerEnabled` / `VTimerEnabled` | —                                                                          |   ✗    | Not emitted; Mesen2 derives from $4200 |
-| `PPU.IRQHBeamPos` / `IRQVBeamPos` | —                                                                              |   ✗    | Not emitted; derived from FillRAM $4207-$420A |
-| `PPU.Mode7{HFlip,VFlip,Repeat}`   | —                                                                              |   ✗    | Should map to `ppu.mode7.{horizontal,vertical}Mirroring`, `fillWithTile0`, `largeMap` |
-| `PPU.Window1{Left,Right}` / `Window2{Left,Right}` | —                                                              |   ✗    | Should map to `ppu.window[N].left/.right` |
-| `PPU.ClipWindow{1,2}{Enable,Inside}[0..5]` | —                                                                     |   ✗    | Should map to `ppu.window[N].activeLayers[L]` / `invertedLayers[L]` |
-| `PPU.Mosaic` / `MosaicStart` / `BGMosaic[4]` | —                                                                  |   ✗    | Mosaic mask bits emitted via `$2106`; per-BG enable not re-emitted to Mesen2 keys |
-| `PPU.{FirstSprite,LastSprite}` | —                                                                                   |   ✗    | Should map to `ppu.fetchSpriteStart/End` |
-| `PPU.VRAMReadBuffer`           | —                                                                                   |   ✗    | Should map to `ppu.vramReadBuffer` |
+| `PPU.HTimerEnabled` / `VTimerEnabled` | —                                                                          |   ✗    | Mesen2 derives from $4200 |
+| `PPU.IRQHBeamPos` / `IRQVBeamPos` | —                                                                              |   ✗    | Mesen2 derives from FillRAM $4207-$420A |
+| `PPU.Mode7HFlip` / `VFlip`     | `ppu.mode7.horizontalMirroring` / `verticalMirroring`                              |   ✓    | PPU offsets 2570 / 2571 |
+| `PPU.Mode7Repeat`              | `ppu.mode7.fillWithTile0` (bit 0), `ppu.mode7.largeMap` (bit 1)                    |   ✓    | PPU offset 2572 |
+| `PPU.Window1Left/Right` / `Window2Left/Right` | `ppu.window[0/1].left/.right`                                       |   ✓    | PPU offsets 2595-2598 |
+| `PPU.ClipWindow{1,2}{Enable,Inside}[0..5]` | `ppu.window[0/1].activeLayers[L]` / `invertedLayers[L]`               |   ✓    | PPU offsets 2602-2635 |
+| `FillRAM[$212E]` / `$212F`     | `ppu.windowMaskMain[0..4]` / `ppu.windowMaskSub[0..4]`                             |   ✓    | Bit unpacking per layer |
+| `PPU.FirstSprite` / `LastSprite` | `ppu.fetchSpriteStart` / `.fetchSpriteEnd`                                       |   ✓    | PPU offsets 2547 / 2548 |
+| `PPU.VRAMReadBuffer`           | `ppu.vramReadBuffer`                                                                |   ✓    | PPU offset 2650 |
+| `PPU.CGFLIP`                   | `ppu.cgramAddressLatch`                                                             |   ✓    | PPU offset 60 |
+| `FillRAM[$2133]` bit 6         | `ppu.extBgEnabled`                                                                  |   ✓    | Mode-7 ExtBg flag |
+| `PPU.Mosaic` / `MosaicStart` / `BGMosaic[4]` | —                                                                  |   ✗    | Mosaic mask bits emitted via `$2106`; per-BG enable not re-emitted as separate keys |
 | `PPU.SavedOAMAddr` / `OAMFlip` / `OAMReadFlip` / `OAMTileAddress` / `OAMWriteRegister` | — |   ✗    | Transient OAM-write latches |
 | `PPU.CGFLIP` / `CGFLIPRead` / `CGSavedByte` | —                                                                      |   ✗    | CGRAM write-pair toggles |
 
@@ -113,9 +117,13 @@ blob. The blob is a flat sequence of `<NUL-terminated key>` + `<uint32 LE size>`
 | `FillRAM[$4201]` WRIO    | `internalRegisters.ioPortOutput`                                            |   ✓    |
 | `FillRAM[$4207..$420A]`  | `internalRegisters.horizontalTimer`, `internalRegisters.verticalTimer`      |   ✓    |
 | `FillRAM[$420D]` MEMSEL  | `internalRegisters.enableFastRom`                                           |   ✓    |
-| `FillRAM[$4202..$4206]`  | `internalRegisters.aluMulDiv.{multOperand1,multOperand2,dividend,divisor}`  |   ✗    | Not emitted forward; left at Mesen2 default |
-| `FillRAM[$4214..$4217]`  | `internalRegisters.aluMulDiv.{divResult,multOrRemainderResult}`             |   ✗    | Not emitted forward |
-| `FillRAM[$4218..$421F]`  | `controlManager.controllerData[]` (or similar)                              |   ✗    | Auto-joypad shadows; Mesen2 re-reads on next scanline |
+| `FillRAM[$4202..$4206]`  | `internalRegisters.aluMulDiv.{multOperand1,multOperand2,dividend,divisor}`  |   ✓    | |
+| `FillRAM[$4214..$4217]`  | `internalRegisters.aluMulDiv.{divResult,multOrRemainderResult}`             |   ✓    | |
+| `FillRAM[$4218..$421F]`  | `internalRegisters.controllerData[0..3]`                                    |   ✓    | Joypad auto-read shadow |
+| `FillRAM[$420D]` bit 0   | `memoryManager.cpuSpeed`                                                    |   ✓    | 6 if FastROM enabled, 8 if slow |
+| —                        | `memoryManager.dramRefreshPosition`                                         |   ⚠    | Constant 538 (NTSC) |
+| —                        | `memoryManager.openBus`                                                     |   ⚠    | Constant 0xFF (default) |
+| —                        | `dmaController.channel[N].dmaActive`                                        |   ⚠    | Zero; mesen2 re-evaluates on next HDMA scan |
 
 ## SPC700 / APU
 
@@ -198,27 +206,61 @@ How we handle it:
    fields are written straight to the .mss so mesen2 resumes the SPC
    mid-execution instead of rebooting it via IPL ROM (which would clobber
    `apuram[$F4..$F7]` — the ports the game polls at `$2140-$2143`).
-7. **SPC↔CPU ports — direction split** (critical and easy to get wrong because
-   Blargg APU and bAPU store them differently):
-   - **`spc.outputReg[0..3]` ← `APU[7..10]`** (`SAPU.OutPorts`). These are the
-     bytes the *SPC* last wrote — what the 65C816 reads at `$2140-$2143`.
-   - **`spc.cpuRegs[0..3]` ← `apuram[$F4..$F7]`** (= `SND[$F4..$F7]`). These
-     are the bytes the *CPU* last wrote — what the SPC reads from its $F4-$F7
-     MMIO. In Blargg APU `apuram[$F4..$F7]` IS the CPU's last write (SPC's read
-     view); in modern bAPU those same bytes are the SPC's output instead. The
-     default forward path writes `spc.outputReg` from `snd[$F4..$F7]` which is
-     correct for modern states but **wrong** for legacy — legacy override here.
+7. **SPC↔CPU ports — both directions seeded from `apuram[$F4..$F7]`** (legacy
+   Blargg APU has subtle two-storage semantics, but in practice the only
+   safe move is to load both sides from the apuram bytes):
+   - **`spc.outputReg[0..3] ← apuram[$F4..$F7]`** (`SND[$F4..$F7]`, the
+     synthesised apuram bytes). The default forward-direction code at line
+     ~408 of `convert.cpp` already writes this from `snd[$F4..$F7]` — we
+     leave it intact for legacy. This matches what the legacy CPU side was
+     reading at `$2140-$2143` (Blargg APU effectively kept the CPU-visible
+     copy in apuram after each SPC write), so a typical CPU wait-for-ack
+     spinloop satisfies on the first frame after load.
+   - **`spc.cpuRegs[0..3] ← apuram[$F4..$F7]`** (same source). In Blargg
+     APU's unified model the CPU's writes also went straight into the SPC's
+     port-read view at `$F4-$F7`, so seeding both directions from the same
+     bytes is consistent. Modern bAPU separates them, but the legacy state
+     can't tell us which side wrote last — seeding both is the best heuristic.
    - **`spc.newCpuRegs[0..3]`** mirrors `spc.cpuRegs`.
    - **`spc.romEnabled`** from `APU[4]` (`SAPU.ShowROM`).
    - **`spc.timersEnabled = 1`** optimistically.
+   - `SAPU.OutPorts` (`APU[7..10]`) is **not** used. In testing for Yoshi's
+     Safari it diverged from `apuram[$F4..$F7]` because the SPC had just
+     started a new echo cycle that wasn't flushed to OutPorts yet — using
+     OutPorts left mesen2 returning the *pre-echo* value to the CPU and
+     the wait spinloop never exited.
 8. **DSP voice / echo state, timer counters, IAPU internals.** Not extracted
    — mesen2 keeps its default DSP/timer state and the music driver re-fills
    it from apuram on the next tick. Audio may glitch for a fraction of a
    second after load.
 9. **`GBJ` and `SHO` are dropped** — Game Boy joypad shadow and preview
    screenshot have no Mesen2 equivalent.
-7. **`GBJ` and `SHO` are dropped** — Game Boy joypad shadow and preview
-   screenshot have no Mesen2 equivalent.
+10. **Category C derivations skipped for legacy.** The "derivable from
+    FillRAM / late-PPU bytes" extra keys (Mode 7 flip flags, window state,
+    ALU operands, controller data, `memoryManager.cpuSpeed`,
+    `dmaController.channel[N].dmaActive`, etc.) are **not** emitted when
+    `original_version >= 1000`. Legacy snes9x 1.5.x sometimes left stale
+    mid-cycle bookkeeping in those FillRAM bytes (notably `$420B = $01` as a
+    mid-DMA marker, Super Scope-style joypad shadows even when game isn't
+    polling joypad). Forwarding those verbatim to mesen2 regressed an
+    otherwise working legacy conversion, so the legacy path skips them and
+    relies on mesen2's defaults — which re-derive the same fields from the
+    first post-load frame's register writes.
+11. **SPC unstick hack** (legacy only): scan the synthesised apuram for the
+    pattern `EC F4 00 D0 FB` (= `MOV Y, !$00F4 ; BNE -3` — the SPC busy-wait
+    on CPUIO0 the SNES IPL-style upload protocol uses) and replace the
+    `D0 FB` with `2F 00` (BRA +0 = unconditional fall-through). Reason:
+    legacy snes9x 1.5.x states captured mid-IPL-upload deadlock — the SPC
+    waits for the CPU to write `0` to CPUIO0, the CPU waits for the SPC to
+    echo back the byte index it last sent, and neither side advances
+    because the legacy state didn't preserve the cycle-precise sync
+    cookies. Patching the wait lets the SPC fall through to the inner
+    `$1947`-style CMP/echo loop where it sends `Y` back on CPUIO0,
+    unblocking the CPU's spin. Trade-off: any *future* upload in the same
+    play session also skips the start-of-upload sync wait — this may glitch
+    one upload but the protocol code is re-issued from ROM on subsequent
+    uploads so they recover. Patches capped at 16 occurrences as a sanity
+    bound.
 
 Probe label: `SNES9x legacy v1.5.x (#!snes9x:1510) — best-effort conversion,
 audio may glitch briefly`.
