@@ -361,3 +361,9 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Local save-state test artifacts
+/states/
+
+# Claude Code per-project files
+.claude/
