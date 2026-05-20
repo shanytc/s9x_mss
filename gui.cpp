@@ -2,15 +2,22 @@
 //   Side A (left) : SNES9x save state (any extension) -> Mesen2 .mss
 //   Side B (right): Mesen2 .mss                       -> SNES9x .000-style state
 //
-// Workflow per side: drop a file (or click Browse). The app validates the
-// header by magic bytes (not by extension), displays format + version, then
-// enables the Convert button. Clicking Convert writes the output next to the
-// input with a "_from_snes9x" / "_from_mesen2" suffix — toggleable via the
-// "Include suffix" checkbox at the bottom of the window.
+// Workflow per side: drop a file or folder (or click Browse / Browse folder).
+// The app validates each input header by magic bytes (not by extension),
+// displays format + version, then enables the Convert button. Folders are
+// scanned non-recursively and a progress bar appears while the batch runs.
+// Clicking Convert writes outputs next to their inputs with a
+// "_from_snes9x" / "_from_mesen2" suffix — toggleable via the "Include
+// suffix" checkbox at the bottom of the window. The snes9x slot number
+// (.000-.999 extension) is always preserved as "_N" (no leading zeros,
+// e.g. Mario.005 -> Mario_5.mss) in the .mss stem and pulled back into
+// the 3-digit padded .NNN extension on the reverse side, so round-trips
+// keep the slot identifiable.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <commdlg.h>
 #include <commctrl.h>
 
@@ -21,6 +28,8 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -37,16 +46,20 @@ enum {
     ID_ROM_CLEAR_B  = 1009,
     ID_UPGRADE_A    = 1010,
     ID_SUFFIX_CB    = 1011,
+    ID_BROWSE_FOLDER_A = 1012,
+    ID_BROWSE_FOLDER_B = 1013,
 };
 
 // ---- per-pane state ----
 struct Pane {
-    HWND drop      = nullptr;   // drop zone (large static)
-    HWND info      = nullptr;   // multi-line info: filename + format + version
-    HWND status    = nullptr;   // result message
-    HWND browse    = nullptr;
-    HWND convert   = nullptr;
-    HWND open_out  = nullptr;
+    HWND drop          = nullptr;   // drop zone (large static)
+    HWND info          = nullptr;   // multi-line info: filename + format + version
+    HWND status        = nullptr;   // result message
+    HWND browse        = nullptr;
+    HWND browse_folder = nullptr;
+    HWND convert       = nullptr;
+    HWND open_out      = nullptr;
+    HWND progress      = nullptr;   // batch progress bar (overlaid on drop zone)
 
     // Side A only — upgrade legacy snes9x 1.5.x to modern format
     HWND upgrade   = nullptr;
@@ -59,8 +72,10 @@ struct Pane {
     HWND rom_browse    = nullptr;
     HWND rom_clear     = nullptr;
 
-    std::wstring input_path;
+    std::wstring input_path;        // selected file (single mode) or folder (batch mode)
     bool         loaded = false;
+    bool         is_batch = false;
+    std::vector<std::wstring> batch_paths;  // valid files discovered in folder
     std::wstring last_output_path;
     std::wstring rom_path;
 };
@@ -97,12 +112,71 @@ static void set_status(Pane& p, const std::wstring& text) {
     SetWindowTextW(p.status, text.c_str());
 }
 
-// Validate the dropped/browsed file, update the pane, enable Convert if OK.
+// Scan `dir` (non-recursively) for files whose magic bytes validate as the
+// expected format, then populate the pane's batch list and info area.
+static void load_folder(Pane& p, const std::wstring& dir, bool forward) {
+    p.input_path = dir;
+    p.loaded = false;
+    p.is_legacy = false;
+    p.is_batch = true;
+    p.batch_paths.clear();
+    EnableWindow(p.convert, FALSE);
+    if (p.upgrade) EnableWindow(p.upgrade, FALSE);
+
+    int scanned = 0;
+    std::error_code ec;
+    fs::path d = fs::path(dir);
+    set_status(p, L"Scanning folder...");
+    RedrawWindow(p.status, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+
+    for (auto it = fs::directory_iterator(d, ec);
+         !ec && it != fs::directory_iterator();
+         it.increment(ec)) {
+        if (ec) break;
+        const fs::directory_entry& entry = *it;
+        if (!entry.is_regular_file(ec)) continue;
+        ++scanned;
+        std::string utf8 = entry.path().string();
+        ProbeResult r = forward ? probe_s9x(utf8) : probe_mss(utf8);
+        if (r.ok) p.batch_paths.push_back(entry.path().wstring());
+    }
+
+    std::wstring fname = d.filename().wstring();
+    if (fname.empty()) fname = dir;  // e.g. "C:\" has no filename component
+    std::wstring info = L"Folder:  " + fname
+                      + L"\nScanned: " + std::to_wstring(scanned) + L" files"
+                      + L"\nValid:   " + std::to_wstring(p.batch_paths.size())
+                      + L" " + (forward ? std::wstring(L"SNES9x")
+                                        : std::wstring(L"Mesen2"))
+                      + L" save state(s)";
+    set_info(p, info);
+
+    if (p.batch_paths.empty()) {
+        set_status(p, L"No valid save states found in this folder.");
+        return;
+    }
+    set_status(p, L"Ready. Click Convert to batch process "
+                  + std::to_wstring(p.batch_paths.size()) + L" file(s).");
+    p.loaded = true;
+    EnableWindow(p.convert, TRUE);
+}
+
+// Validate the dropped/browsed path. If it's a directory, route to the
+// folder loader; otherwise probe it as a single save state.
 // `forward` true == side A (expect SNES9x); false == side B (expect Mesen2).
 static void load_file(Pane& p, const std::wstring& path, bool forward) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES
+        && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        load_folder(p, path, forward);
+        return;
+    }
+
     p.input_path = path;
     p.loaded = false;
     p.is_legacy = false;
+    p.is_batch = false;
+    p.batch_paths.clear();
     EnableWindow(p.convert, FALSE);
     if (p.upgrade) EnableWindow(p.upgrade, FALSE);
 
@@ -139,57 +213,175 @@ static void load_file(Pane& p, const std::wstring& path, bool forward) {
     }
 }
 
-static void run_conversion(Pane& p, bool forward) {
-    if (!p.loaded || p.input_path.empty()) return;
-
-    std::string in_utf8 = from_w(p.input_path);
-    fs::path q(in_utf8);
+// Compute the output path for a single input, applying slot preservation
+// (.NNN <-> _N) and the optional _from_X suffix tag.
+static std::string compute_output_path(const fs::path& q, bool forward,
+                                       bool include_suffix) {
     std::string stem = q.stem().string();
-    std::string out_utf8;
-    bool include_suffix = g_suffix_cb
-        && SendMessageW(g_suffix_cb, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    std::string in_ext = q.extension().string();
+
+    auto ends_with = [](const std::string& s, const char* t) -> bool {
+        size_t tl = std::strlen(t);
+        return s.size() >= tl && s.compare(s.size() - tl, tl, t) == 0;
+    };
+    auto is_digit = [](char c){ return c >= '0' && c <= '9'; };
+
     if (forward) {
+        // Preserve the snes9x slot (.000-.999) in the .mss stem as _N (no
+        // leading zeros: .005 -> _5, .010 -> _10).
+        if (in_ext.size() == 4 && in_ext[0] == '.'
+            && is_digit(in_ext[1]) && is_digit(in_ext[2]) && is_digit(in_ext[3])) {
+            std::string slot = in_ext.substr(1);
+            size_t nz = slot.find_first_not_of('0');
+            slot = (nz == std::string::npos) ? "0" : slot.substr(nz);
+            std::string slot_tag = "_" + slot;
+            if (!ends_with(stem, slot_tag.c_str())) stem += slot_tag;
+        }
         if (include_suffix) {
             std::string tag = "_from_snes9x";
             if (stem.find(tag) == std::string::npos) stem += tag;
         }
-        out_utf8 = (q.parent_path() / (stem + ".mss")).string();
-    } else {
-        if (include_suffix) {
-            std::string tag = "_from_mesen2";
-            if (stem.find(tag) == std::string::npos) stem += tag;
-        }
-        // SNES9x states traditionally use .000-.999 numbered slots; keep the
-        // user's original extension so naming feels consistent.
-        std::string ext = q.extension().string();
-        if (ext.empty() || ext == ".mss") ext = ".000";
-        out_utf8 = (q.parent_path() / (stem + ext)).string();
+        return (q.parent_path() / (stem + ".mss")).string();
     }
 
-    set_status(p, L"Converting...");
-    RedrawWindow(p.status, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
-
-    try {
-        if (forward) {
-            convert_s9x_to_mss(in_utf8, out_utf8);
-        } else {
-            int sel = (int)SendMessageW(p.region_combo, CB_GETCURSEL, 0, 0);
-            RegionOverride r = (sel == 1) ? RegionOverride::ForceNTSC
-                             : (sel == 2) ? RegionOverride::ForcePAL
-                             :              RegionOverride::Auto;
-            convert_mss_to_s9x(in_utf8, out_utf8, r, from_w(p.rom_path));
+    // Reverse: pull trailing _N (1-3 digits) out, optionally peeling
+    // trailing _from_X tags first, and use it as a 3-digit padded .NNN
+    // extension (snes9x convention).
+    while (true) {
+        if (ends_with(stem, "_from_snes9x"))
+            stem.erase(stem.size() - 12);
+        else if (ends_with(stem, "_from_mesen2"))
+            stem.erase(stem.size() - 12);
+        else break;
+    }
+    std::string ext;
+    size_t under = stem.rfind('_');
+    if (under != std::string::npos && under + 1 < stem.size()) {
+        std::string tail = stem.substr(under + 1);
+        if (tail.size() >= 1 && tail.size() <= 3
+            && std::all_of(tail.begin(), tail.end(), is_digit)) {
+            while (tail.size() < 3) tail.insert(tail.begin(), '0');
+            ext = "." + tail;
+            stem.erase(under);
         }
-    } catch (const std::exception& e) {
-        set_status(p, L"Error: " + to_w(e.what()));
-        EnableWindow(p.open_out, FALSE);
+    }
+    if (ext.empty()) {
+        ext = in_ext;
+        if (ext.empty() || ext == ".mss") ext = ".000";
+    }
+    if (include_suffix) {
+        std::string tag = "_from_mesen2";
+        if (stem.find(tag) == std::string::npos) stem += tag;
+    }
+    return (q.parent_path() / (stem + ext)).string();
+}
+
+// Pump pending Windows messages so the UI stays responsive during a long
+// batch job that runs on the main thread.
+static void pump_messages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+static void convert_one(const std::string& in_utf8, const std::string& out_utf8,
+                        bool forward, Pane& p) {
+    if (forward) {
+        convert_s9x_to_mss(in_utf8, out_utf8);
+    } else {
+        int sel = (int)SendMessageW(p.region_combo, CB_GETCURSEL, 0, 0);
+        RegionOverride r = (sel == 1) ? RegionOverride::ForceNTSC
+                         : (sel == 2) ? RegionOverride::ForcePAL
+                         :              RegionOverride::Auto;
+        convert_mss_to_s9x(in_utf8, out_utf8, r, from_w(p.rom_path));
+    }
+}
+
+static void run_conversion(Pane& p, bool forward) {
+    if (!p.loaded) return;
+    bool include_suffix = g_suffix_cb
+        && SendMessageW(g_suffix_cb, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+    // ----- single-file path -----
+    if (!p.is_batch) {
+        if (p.input_path.empty()) return;
+        std::string in_utf8 = from_w(p.input_path);
+        fs::path q(in_utf8);
+        std::string out_utf8 = compute_output_path(q, forward, include_suffix);
+
+        set_status(p, L"Converting...");
+        RedrawWindow(p.status, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+
+        try {
+            convert_one(in_utf8, out_utf8, forward, p);
+        } catch (const std::exception& e) {
+            set_status(p, L"Error: " + to_w(e.what()));
+            EnableWindow(p.open_out, FALSE);
+            return;
+        }
+
+        p.last_output_path = to_w(out_utf8);
+        std::wstring msg = L"Wrote: ";
+        msg += fs::path(p.last_output_path).filename().wstring();
+        set_status(p, msg);
+        EnableWindow(p.open_out, TRUE);
         return;
     }
 
-    p.last_output_path = to_w(out_utf8);
-    std::wstring msg = L"Wrote: ";
-    msg += fs::path(p.last_output_path).filename().wstring();
-    set_status(p, msg);
-    EnableWindow(p.open_out, TRUE);
+    // ----- batch (folder) path -----
+    if (p.batch_paths.empty()) return;
+    const int n = (int)p.batch_paths.size();
+    int ok = 0, fail = 0;
+    std::wstring last_err;
+
+    EnableWindow(p.convert, FALSE);
+    EnableWindow(p.browse, FALSE);
+    EnableWindow(p.browse_folder, FALSE);
+    EnableWindow(p.open_out, FALSE);
+    if (p.upgrade) EnableWindow(p.upgrade, FALSE);
+
+    SendMessageW(p.progress, PBM_SETRANGE32, 0, n);
+    SendMessageW(p.progress, PBM_SETPOS, 0, 0);
+    ShowWindow(p.progress, SW_SHOW);
+
+    for (int i = 0; i < n; ++i) {
+        std::wstring wpath = p.batch_paths[i];
+        std::string in_utf8 = from_w(wpath);
+        fs::path q(in_utf8);
+        std::wstring fname = q.filename().wstring();
+        set_status(p,
+            L"Converting " + std::to_wstring(i + 1) + L"/"
+            + std::to_wstring(n) + L": " + fname);
+        RedrawWindow(p.status, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+
+        std::string out_utf8 = compute_output_path(q, forward, include_suffix);
+        try {
+            convert_one(in_utf8, out_utf8, forward, p);
+            p.last_output_path = to_w(out_utf8);
+            ++ok;
+        } catch (const std::exception& e) {
+            ++fail;
+            last_err = to_w(e.what());
+        }
+        SendMessageW(p.progress, PBM_SETPOS, i + 1, 0);
+        pump_messages();
+    }
+
+    ShowWindow(p.progress, SW_HIDE);
+    EnableWindow(p.convert, TRUE);
+    EnableWindow(p.browse, TRUE);
+    EnableWindow(p.browse_folder, TRUE);
+    if (p.upgrade && p.is_legacy) EnableWindow(p.upgrade, TRUE);
+    if (ok > 0) EnableWindow(p.open_out, TRUE);
+
+    std::wstring summary = L"Done. " + std::to_wstring(ok) + L" converted";
+    if (fail > 0) {
+        summary += L", " + std::to_wstring(fail) + L" failed";
+        if (!last_err.empty()) summary += L" (last error: " + last_err + L")";
+    }
+    set_status(p, summary);
 }
 
 static void browse_for(Pane& p, bool forward) {
@@ -214,6 +406,24 @@ static void browse_for(Pane& p, bool forward) {
     if (GetOpenFileNameW(&ofn)) {
         load_file(p, buf, forward);
     }
+}
+
+static void browse_for_folder(Pane& p, bool forward) {
+    wchar_t buf[MAX_PATH] = L"";
+    BROWSEINFOW bi{};
+    bi.hwndOwner = g_main;
+    bi.pszDisplayName = buf;
+    bi.lpszTitle = forward
+        ? L"Pick a folder of SNES9x save states"
+        : L"Pick a folder of Mesen2 .mss save states";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return;
+    wchar_t path[MAX_PATH] = L"";
+    if (SHGetPathFromIDListW(pidl, path)) {
+        load_folder(p, path, forward);
+    }
+    CoTaskMemFree(pidl);
 }
 
 static void run_upgrade(Pane& p) {
@@ -347,6 +557,15 @@ static void layout_pane(const Pane& p, HWND title, int x, int top_y,
     y += title_h + GAP;
     SetWindowPos(p.drop, nullptr, x, y, pane_w, drop_h,
                  SWP_NOZORDER | SWP_NOACTIVATE);
+    // Progress bar overlays the bottom of the drop zone, centred horizontally.
+    if (p.progress) {
+        const int prog_h = 18;
+        const int prog_pad = 24;
+        SetWindowPos(p.progress, nullptr,
+                     x + prog_pad, y + drop_h - prog_h - 10,
+                     pane_w - 2 * prog_pad, prog_h,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     y += drop_h + GAP;
     SetWindowPos(p.info, nullptr, x + 8, y, pane_w - 16, ROW_INFO,
                  SWP_NOZORDER | SWP_NOACTIVATE);
@@ -390,16 +609,30 @@ static void layout_pane(const Pane& p, HWND title, int x, int top_y,
         y += ROW_BUTTONS + GAP + ROW_STATUS;
     }
     y += GAP;
-    SetWindowPos(p.browse,   nullptr, x + 8,       y, 100, ROW_BUTTONS,
+    // Bottom button row: Browse | Browse folder | Convert | Open output folder.
+    // Widths picked to fit the ~435 px pane with small inter-button gaps.
+    const int W_BR  = 75;
+    const int W_BF  = 115;
+    const int W_CV  = 75;
+    const int W_OO  = 135;
+    const int BTN_GAP = 8;
+    int bx = x + 8;
+    SetWindowPos(p.browse,        nullptr, bx, y, W_BR, ROW_BUTTONS,
                  SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(p.convert,  nullptr, x + 8 + 108, y, 100, ROW_BUTTONS,
+    bx += W_BR + BTN_GAP;
+    SetWindowPos(p.browse_folder, nullptr, bx, y, W_BF, ROW_BUTTONS,
                  SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(p.open_out, nullptr, x + 8 + 216, y, 180, ROW_BUTTONS,
+    bx += W_BF + BTN_GAP;
+    SetWindowPos(p.convert,       nullptr, bx, y, W_CV, ROW_BUTTONS,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    bx += W_CV + BTN_GAP;
+    SetWindowPos(p.open_out,      nullptr, bx, y, W_OO, ROW_BUTTONS,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void create_pane(HWND parent, Pane& p, const wchar_t* drop_text,
-                        int browse_id, int convert_id, int open_id,
+                        int browse_id, int folder_id,
+                        int convert_id, int open_id,
                         bool with_region_controls = false,
                         bool with_upgrade_button = false) {
     HINSTANCE hi = GetModuleHandleW(nullptr);
@@ -430,6 +663,19 @@ static void create_pane(HWND parent, Pane& p, const wchar_t* drop_text,
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         0, 0, 100, 32, parent, HMENU(intptr_t(browse_id)), hi, nullptr);
     SendMessageW(p.browse, WM_SETFONT, WPARAM(g_font_norm), TRUE);
+
+    p.browse_folder = CreateWindowExW(0, L"BUTTON", L"Browse folder...",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 100, 32, parent, HMENU(intptr_t(folder_id)), hi, nullptr);
+    SendMessageW(p.browse_folder, WM_SETFONT, WPARAM(g_font_norm), TRUE);
+
+    // Progress bar overlays the drop zone during batch conversion; hidden
+    // otherwise. Created after p.drop so it's later in Z-order and paints on
+    // top.
+    p.progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+        WS_CHILD | PBS_SMOOTH,
+        0, 0, 100, 22, parent, nullptr, hi, nullptr);
+    SendMessageW(p.progress, PBM_SETRANGE32, 0, 100);
 
     p.convert  = CreateWindowExW(0, L"BUTTON", L"Convert",
         WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_DISABLED,
@@ -516,24 +762,25 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(g_title_b, WM_SETFONT, WPARAM(g_font_big), TRUE);
 
         create_pane(h, g_a,
-            L"\nDrop SNES9x save state here\n\n"
+            L"\nDrop SNES9x save state (or folder) here\n\n"
             L"Any extension - validated by header",
-            ID_BROWSE_A, ID_CONVERT_A, ID_OPEN_OUT_A,
+            ID_BROWSE_A, ID_BROWSE_FOLDER_A, ID_CONVERT_A, ID_OPEN_OUT_A,
             /*with_region_controls=*/false,
             /*with_upgrade_button=*/true);
         create_pane(h, g_b,
-            L"\nDrop Mesen2 .mss here\n",
-            ID_BROWSE_B, ID_CONVERT_B, ID_OPEN_OUT_B, true);
+            L"\nDrop Mesen2 .mss (or folder) here\n",
+            ID_BROWSE_B, ID_BROWSE_FOLDER_B, ID_CONVERT_B, ID_OPEN_OUT_B, true);
 
         // Footer: global toggle for the "_from_snes9x" / "_from_mesen2" tag
-        // applied to output filenames. Checked by default (legacy behavior);
-        // unchecked when the user wants the output to keep the input's name.
+        // applied to output filenames. Off by default — users typically want
+        // the output to keep the input's name; the slot number (_N) is still
+        // preserved either way.
         g_suffix_cb = CreateWindowExW(0, L"BUTTON",
             L"Include \"_from_snes9x\" / \"_from_mesen2\" suffix in output filename",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
             0, 0, 100, 22, h, HMENU(intptr_t(ID_SUFFIX_CB)), hi, nullptr);
         SendMessageW(g_suffix_cb, WM_SETFONT, WPARAM(g_font_norm), TRUE);
-        SendMessageW(g_suffix_cb, BM_SETCHECK, BST_CHECKED, 0);
+        SendMessageW(g_suffix_cb, BM_SETCHECK, BST_UNCHECKED, 0);
         return 0;
     }
 
@@ -562,15 +809,17 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND: {
         int id = LOWORD(w);
         switch (id) {
-        case ID_BROWSE_A:   browse_for(g_a, true);  break;
-        case ID_BROWSE_B:   browse_for(g_b, false); break;
-        case ID_CONVERT_A:  run_conversion(g_a, true);  break;
-        case ID_CONVERT_B:  run_conversion(g_b, false); break;
-        case ID_OPEN_OUT_A: open_folder(g_a.last_output_path); break;
-        case ID_OPEN_OUT_B: open_folder(g_b.last_output_path); break;
-        case ID_ROM_BROWSE_B: browse_for_rom(g_b); break;
-        case ID_ROM_CLEAR_B:  clear_rom(g_b);      break;
-        case ID_UPGRADE_A:    run_upgrade(g_a);    break;
+        case ID_BROWSE_A:        browse_for(g_a, true);  break;
+        case ID_BROWSE_B:        browse_for(g_b, false); break;
+        case ID_BROWSE_FOLDER_A: browse_for_folder(g_a, true);  break;
+        case ID_BROWSE_FOLDER_B: browse_for_folder(g_b, false); break;
+        case ID_CONVERT_A:       run_conversion(g_a, true);  break;
+        case ID_CONVERT_B:       run_conversion(g_b, false); break;
+        case ID_OPEN_OUT_A:      open_folder(g_a.last_output_path); break;
+        case ID_OPEN_OUT_B:      open_folder(g_b.last_output_path); break;
+        case ID_ROM_BROWSE_B:    browse_for_rom(g_b); break;
+        case ID_ROM_CLEAR_B:     clear_rom(g_b);      break;
+        case ID_UPGRADE_A:       run_upgrade(g_a);    break;
         }
         return 0;
     }
@@ -598,8 +847,12 @@ static LRESULT CALLBACK main_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int show) {
-    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
+    // ICC_PROGRESS_CLASS registers msctls_progress32 for the batch progress
+    // bar; OleInitialize is needed by SHBrowseForFolderW with BIF_NEWDIALOGSTYLE.
+    INITCOMMONCONTROLSEX icc{ sizeof(icc),
+                              ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
+    OleInitialize(nullptr);
 
     const wchar_t* cls = L"S9xMssConverterWnd";
     WNDCLASSEXW wc{};
