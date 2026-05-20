@@ -29,3 +29,10 @@ endif()
 target_link_libraries(s9x_mss_gui PRIVATE
     user32 gdi32 shell32 comdlg32 comctl32 ole32
 )
+
+# 64-bit builds get a "-x64" suffix; 32-bit keeps the plain name.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(s9x_mss_gui PROPERTIES OUTPUT_NAME "s9x_mss-x64")
+else()
+    set_target_properties(s9x_mss_gui PROPERTIES OUTPUT_NAME "s9x_mss")
+endif()

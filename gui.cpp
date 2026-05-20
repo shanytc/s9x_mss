@@ -874,7 +874,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int show) {
     AdjustWindowRectEx(&wantR, style, FALSE, WS_EX_ACCEPTFILES);
     g_main = CreateWindowExW(
         WS_EX_ACCEPTFILES, cls,
-        L"SNES9x ↔ Mesen2 Save State Converter",
+        L"SNES9x ↔ Mesen2 Save State Converter v1.0.0",
         style, CW_USEDEFAULT, CW_USEDEFAULT,
         wantR.right - wantR.left, wantR.bottom - wantR.top,
         nullptr, nullptr, hInst, nullptr);
